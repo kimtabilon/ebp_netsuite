@@ -1,6 +1,8 @@
 import { Router } from "express";
 import log from "../config/logger.config";
+import { getDb } from "../config/mongdodb.config";
 import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "../services/po.sync";
+import { stagePurchaseOrders } from "../services/po.stage";
 import { postToNetsuiteForPO } from "../services/netsuite.client";
 
 const router = Router();
@@ -15,12 +17,65 @@ router.post("/po-test", async (req: any, res: any) => {
     }
 });
 
-// ─── Sync POs ───────────────────────────────────────────────────────────────
+// ─── Stage POs (ebp_pomanager → suite_purchase_order) ───────────────────────
+router.get("/stage-po", async (_req: any, res: any) => {
+    try {
+        const result = await stagePurchaseOrders();
+        res.json({ success: true, ...result });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ─── Sync POs (suite_purchase_order → NetSuite ERP) ─────────────────────────
 router.get("/sync-po", async (_req: any, res: any) => {
     try {
         const results = await syncPurchaseOrdersToNetsuite();
         res.json({ success: true, count: results.length, results });
     } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ─── Reset PO sync flags (clean sync) ───────────────────────────────────────
+// GET  /reset-po-sync → dry-run (count docs with ns_ flags)
+// POST /reset-po-sync → unset all ns_ fields
+router.get("/reset-po-sync", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_purchase_order");
+        const count = await col.countDocuments({
+            $or: [
+                { ns_synced: true },
+                { ns_failed: true },
+                { ns_error: { $exists: true } },
+                { ns_retry_count: { $exists: true } },
+            ]
+        });
+        res.json({ success: true, action: "dry_run", orders_with_sync_flags: count });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+router.post("/reset-po-sync", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_purchase_order");
+        const result = await col.updateMany(
+            {},
+            {
+                $set: { ns_synced: false },
+                $unset: {
+                    ns_synced_at: "", ns_result: "", ns_error: "",
+                    ns_error_at: "", ns_retry_count: "", ns_failed: "",
+                }
+            }
+        );
+        log.info(`[RESET-PO-SYNC] Reset ${result.modifiedCount} POs`);
+        res.json({ success: true, action: "reset", matched: result.matchedCount, modified: result.modifiedCount });
+    } catch (e: any) {
+        log.error("[RESET-PO-SYNC] Error:", e);
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -84,6 +139,64 @@ router.post("/test-po-flow", async (req: any, res: any) => {
         res.json({ success: true, type: poType, po: poResult });
     } catch (e: any) {
         res.status(500).json({ success: false, error: e?.response?.data || e.message });
+    }
+});
+
+// ─── Dropship POs with synced SOs ───────────────────────────────────────────
+// Returns website_order_numbers where:
+//   suite_purchase_order.po_type = "Dropship"
+//   AND a matching suite_sales_order (otherrefnum = website_order_number)
+//   has ns_synced=true, ns_result="created"
+router.get("/dropship-ready", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const poColl = nsDb.collection("suite_purchase_order");
+        const soColl = nsDb.collection("suite_sales_order");
+
+        // 1. All dropship PO website_order_numbers
+        const dropshipPOs = await poColl
+            .find({ po_type: "Dropship", website_order_number: { $exists: true, $ne: "" } })
+            .project({ website_order_number: 1, po_number: 1, vendor_id: 1, ns_synced: 1 })
+            .toArray();
+
+        if (dropshipPOs.length === 0) {
+            return res.json({ success: true, count: 0, matched: [] });
+        }
+
+        const orderNumbers = dropshipPOs.map((p: any) => p.website_order_number);
+
+        // 2. Synced SOs whose otherrefnum matches
+        const syncedSOs = await soColl
+            .find({
+                otherrefnum: { $in: orderNumbers },
+                ns_synced: true,
+                ns_result: "created",
+            })
+            .project({ otherrefnum: 1 })
+            .toArray();
+
+        const syncedSet = new Set(syncedSOs.map((s: any) => s.otherrefnum));
+
+        // 3. Build matched list
+        const matched = dropshipPOs
+            .filter((p: any) => syncedSet.has(p.website_order_number))
+            .map((p: any) => ({
+                website_order_number: p.website_order_number,
+                po_number: p.po_number,
+                vendor_id: p.vendor_id,
+                po_synced: !!p.ns_synced,
+            }));
+
+        res.json({
+            success: true,
+            total_dropship_pos: dropshipPOs.length,
+            total_synced_sos: syncedSOs.length,
+            count: matched.length,
+            matched,
+        });
+    } catch (e: any) {
+        log.error("[DROPSHIP-READY] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 

@@ -53,7 +53,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         var snap = { header: {}, lines: [] };
         var headerFields = [
             "customform", "entity", "subsidiary", "otherrefnum",
-            "trandate", "memo", "currency", "custbody1", "custbody2",
+            "trandate", "currency", "custbody1", "custbody2",
             "custbody_otherrefnumber_custom"
         ];
         for (var hi = 0; hi < headerFields.length; hi++) {
@@ -181,6 +181,60 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         return null;
     }
 
+    // ── Copy SO shipping address → PO (Dropship: ship to customer) ─────
+    function copySOShippingToPO(soId, po) {
+        try {
+            var so = record.load({ type: record.Type.SALES_ORDER, id: soId, isDynamic: false });
+            var soShip = so.getSubrecord({ fieldId: "shippingaddress" });
+
+            var addrFields = {
+                country:   soShip.getValue({ fieldId: "country" }) || "US",
+                addressee: soShip.getValue({ fieldId: "addressee" }) || "",
+                attention: soShip.getValue({ fieldId: "attention" }) || "",
+                addr1:     soShip.getValue({ fieldId: "addr1" }) || "",
+                addr2:     soShip.getValue({ fieldId: "addr2" }) || "",
+                city:      soShip.getValue({ fieldId: "city" }) || "",
+                state:     soShip.getValue({ fieldId: "state" }) || "",
+                zip:       soShip.getValue({ fieldId: "zip" }) || "",
+                addrphone: soShip.getValue({ fieldId: "addrphone" }) || ""
+            };
+
+            log.debug("SO_SHIP_ADDR", JSON.stringify(addrFields));
+
+            // Clear predefined list → enables custom address entry
+            po.setValue({ fieldId: "shipaddresslist", value: "" });
+
+            var poShip = po.getSubrecord({ fieldId: "shippingaddress" });
+            poShip.setValue({ fieldId: "country",   value: addrFields.country });
+            poShip.setValue({ fieldId: "addressee", value: addrFields.addressee });
+            if (addrFields.attention) poShip.setValue({ fieldId: "attention", value: addrFields.attention });
+            poShip.setValue({ fieldId: "addr1", value: addrFields.addr1 });
+            if (addrFields.addr2) poShip.setValue({ fieldId: "addr2", value: addrFields.addr2 });
+            poShip.setValue({ fieldId: "city",  value: addrFields.city });
+            poShip.setValue({ fieldId: "state", value: addrFields.state });
+            poShip.setValue({ fieldId: "zip",   value: addrFields.zip });
+            if (addrFields.addrphone) poShip.setValue({ fieldId: "addrphone", value: addrFields.addrphone });
+
+            log.debug("PO_SHIP_ADDR_SET", "Copied SO " + soId + " shipping address to PO");
+            return { success: true, address: addrFields };
+        } catch (e) {
+            log.error("COPY_SHIP_ADDR_ERR", "SO " + soId + ": " + e.message);
+            return { success: false, error: e.message };
+        }
+    }
+
+    // ── Set PO ship-to = warehouse location (Stocking) ──────────────────
+    function setStockingShipAddress(po, locationId) {
+        try {
+            po.setValue({ fieldId: "shipaddresslist", value: parseInt(locationId, 10) });
+            log.debug("STOCKING_SHIP_ADDR", "Set shipaddresslist to location " + locationId);
+            return { success: true, locationId: locationId };
+        } catch (e) {
+            log.debug("STOCKING_SHIP_ADDR_ERR", e.message);
+            return { success: false, error: e.message };
+        }
+    }
+
     // ── Update SO for Dropship — location + qty/amount sync ─────────────
     // Sets location=Dropship AND updates qty/amount on matching lines.
     // This MUST run BEFORE record.create with defaultValues.soid so the PO
@@ -282,9 +336,11 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
     // ── Set PO header fields ────────────────────────────────────────────
     function setPOHeaders(po, opts) {
+        try { po.setValue({ fieldId: "tranid", value: "PO" + String(opts.po_number) }); } catch (e) {
+            log.debug("TRANID_SKIP", "Could not set tranid: " + e.message);
+        }
         po.setValue({ fieldId: "otherrefnum", value: String(opts.po_number) });
         po.setValue({ fieldId: "trandate",    value: new Date() });
-        po.setValue({ fieldId: "memo",        value: opts.website_order_number });
 
         try { po.setValue({ fieldId: "custbody2", value: String(opts.distributor_order_number || opts.po_number) }); } catch (e) {
             log.debug("FIELD_SKIP", "custbody2: " + e.message);
@@ -297,9 +353,34 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 log.debug("FIELD_SKIP", "custbody_otherrefnumber_custom: " + e.message);
             }
         }
-        if (Array.isArray(opts.invoice) && opts.invoice.length > 0) {
-            po.setValue({ fieldId: "memo", value: opts.website_order_number + " | INV: " + opts.invoice[0] });
+    }
+
+    // ── Clear createpo + povendor on SO after auto-PO is confirmed ─────────
+    // The PO link (createdfrom) is permanent once saved — clearing createpo
+    // prevents duplicate auto-POs on future SO saves and hides the 'Drop Ship'
+    // column from the SO UI. Uses ignoreFieldChange:true to prevent sourcing
+    // from re-setting them during the clear.
+    function clearSOCreatePO(soId) {
+        var so = record.load({ type: record.Type.SALES_ORDER, id: soId, isDynamic: true });
+        var lineCount = so.getLineCount({ sublistId: "item" });
+        var cleared = 0;
+
+        for (var ci = 0; ci < lineCount; ci++) {
+            so.selectLine({ sublistId: "item", line: ci });
+            try {
+                so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: " ", ignoreFieldChange: true });
+                so.setCurrentSublistValue({ sublistId: "item", fieldId: "povendor", value: "",  ignoreFieldChange: true });
+                so.commitLine({ sublistId: "item" });
+                cleared++;
+            } catch (lineErr) {
+                log.debug("SO_CLEAR_LINE_ERR", "Line " + ci + ": " + lineErr.message);
+                try { so.cancelLine({ sublistId: "item" }); } catch (e) {}
+            }
         }
+
+        var cleanedId = so.save({ enableSourcing: false, ignoreMandatoryFields: true });
+        log.debug("SO_CREATEPO_CLEAN_SAVED", "SO " + cleanedId + " — cleared createpo/povendor on " + cleared + "/" + lineCount + " lines");
+        return { soId: cleanedId, linesCleared: cleared, totalLines: lineCount };
     }
 
     // ── Main POST handler ───────────────────────────────────────────────
@@ -451,51 +532,163 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                     setPOHeaders(po, headerOpts);
 
                 } else {
-                    // Step 1: Update SO — location=Dropship + qty to match order_items
-                    // This prevents DROP_SHIP_ERROR on po.save() back-sync
-                    var dropshipLocId = findLocationByName("Dropship");
-                    soSetupResult = updateSOForDropship(linkedSoId, dropshipLocId, resolvedItems);
-                    log.debug("SO_SETUP_RESULT", JSON.stringify(soSetupResult));
+                    // ── No auto-PO yet — update SO to trigger auto-PO via createpo='DropShip' ──
+                    log.debug("NO_AUTO_PO", "No linked PO for SO " + linkedSoId + " — updating SO to trigger auto-PO");
 
-                    // Step 2: Fetch subsidiary for defaultValues
-                    var soSubsidiary = null;
                     try {
-                        var soRec = search.lookupFields({
-                            type: search.Type.SALES_ORDER,
-                            id: linkedSoId,
-                            columns: ["subsidiary"]
-                        });
-                        if (soRec.subsidiary && soRec.subsidiary[0]) {
-                            soSubsidiary = parseInt(soRec.subsidiary[0].value, 10);
+                        // Step 1: Load SO in static mode (defers validation to save)
+                        var soRec = record.load({ type: record.Type.SALES_ORDER, id: linkedSoId, isDynamic: false });
+                        var soLineCount = soRec.getLineCount({ sublistId: "item" });
+                        var soLinesUpdated = 0;
+
+                        for (var sli = 0; sli < soLineCount; sli++) {
+                            var soLineItemId = soRec.getSublistValue({ sublistId: "item", fieldId: "item", line: sli });
+
+                            // Look up item's preferred vendor (must be on vendor sublist)
+                            var preferredVendor = null;
+                            try {
+                                var itemLookup = search.lookupFields({
+                                    type: search.Type.ITEM,
+                                    id: soLineItemId,
+                                    columns: ["vendor"]
+                                });
+                                if (itemLookup.vendor && itemLookup.vendor.length > 0) {
+                                    preferredVendor = parseInt(itemLookup.vendor[0].value, 10);
+                                    log.debug("PREFERRED_VENDOR", "Item " + soLineItemId + " preferred vendor: " + preferredVendor);
+                                }
+                            } catch (vlErr) {
+                                log.debug("VENDOR_LOOKUP_ERR", "Item " + soLineItemId + ": " + vlErr.message);
+                            }
+
+                            // Set createpo='DropShip' on this SO line
+                            soRec.setSublistValue({ sublistId: "item", fieldId: "createpo", line: sli, value: "DropShip" });
+
+                            // povendor: preferred vendor first, then fall back to payload vendor_id.
+                            // createpo='DropShip' REQUIRES a povendor — without it NS rejects the SO save.
+                            var resolvedVendor = preferredVendor || (vendor_id ? parseInt(vendor_id, 10) : null);
+                            if (resolvedVendor) {
+                                soRec.setSublistValue({ sublistId: "item", fieldId: "povendor", line: sli, value: resolvedVendor });
+                                log.debug("SO_LINE_DROPSHIP", "Line " + sli + ": createpo=DropShip, povendor=" + resolvedVendor + (preferredVendor ? " (preferred)" : " (payload fallback)"));
+                            } else {
+                                log.debug("SO_LINE_DROPSHIP", "Line " + sli + ": createpo=DropShip, no vendor — skipping povendor");
+                            }
+
+                            soLinesUpdated++;
                         }
-                    } catch (subErr) {
-                        log.debug("SO_SUBSIDIARY_ERR", subErr.message);
+
+                        // Step 2: Save SO → should trigger NetSuite auto-PO creation
+                        var savedSoId = soRec.save({ enableSourcing: true, ignoreMandatoryFields: true });
+                        log.debug("SO_DROPSHIP_SAVED", "SO " + savedSoId + " updated — " + soLinesUpdated + " lines set to createpo=DropShip");
+                        soSetupResult = { success: true, soId: savedSoId, linesUpdated: soLinesUpdated };
+
+                        // Step 3: Find auto-created PO via createdfrom search
+                        autoPOInfo = findLinkedPO(linkedSoId);
+
+                        if (autoPOInfo) {
+                            // Auto-PO found — load it and apply our form/vendor/headers
+                            log.debug("AUTO_PO_FOUND", "Auto-PO " + autoPOInfo.poNumber + " (ID " + autoPOInfo.id + ") linked to SO " + linkedSoId);
+                            po = record.load({ type: record.Type.PURCHASE_ORDER, id: autoPOInfo.id, isDynamic: true });
+                            isUpdate = true;
+
+                            var dsFormId = findFormId("Ecomm BP - Purchase Order");
+                            if (dsFormId) po.setValue({ fieldId: "customform", value: parseInt(dsFormId, 10) });
+                            if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                            setPOHeaders(po, headerOpts);
+
+                            // ── Step 4: Clean up SO — clear createpo + povendor ──────────
+                            // PO is now linked via createdfrom (permanent). Clearing createpo
+                            // on the SO prevents NetSuite from showing 'Drop Ship' on the SO
+                            // UI and avoids duplicate auto-PO attempts on future SO saves.
+                            try {
+                                var soCleanResult = clearSOCreatePO(savedSoId);
+                                log.debug("SO_CREATEPO_CLEARED", JSON.stringify(soCleanResult));
+                                if (soSetupResult) soSetupResult.createpoCleared = soCleanResult;
+                            } catch (cleanErr) {
+                                log.error("SO_CREATEPO_CLEAR_ERR", cleanErr.message);
+                            }
+
+                        } else {
+                            // Auto-PO NOT created — use record.transform (SO → PO) to ensure createdfrom is set.
+                            log.debug("AUTO_PO_MISSING", "No auto-PO found — creating PO via record.transform from SO " + linkedSoId);
+                            try {
+                                po = record.transform({
+                                    fromType: record.Type.SALES_ORDER,
+                                    fromId:   parseInt(linkedSoId, 10),
+                                    toType:   record.Type.PURCHASE_ORDER,
+                                    isDynamic: true,
+                                    defaultValues: { entity: parseInt(vendor_id, 10) }
+                                });
+                                // Force explicit link just in case
+                                try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                            } catch (transformErr) {
+                                // transform failed — last resort: create standalone PO
+                                log.error("TRANSFORM_FAILED", transformErr.message);
+                                po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
+                                if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                                try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                            }
+                            isDropshipCreate = true;
+
+                            var dsFormId2 = findFormId("Ecomm BP - Purchase Order");
+                            if (dsFormId2) po.setValue({ fieldId: "customform", value: parseInt(dsFormId2, 10) });
+                            if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                            setPOHeaders(po, headerOpts);
+
+                            // Clean up SO — remove Drop Ship from lines (best-effort)
+                            try {
+                                var soCleanResult2 = clearSOCreatePO(savedSoId);
+                                log.debug("SO_CREATEPO_CLEARED_FALLBACK", JSON.stringify(soCleanResult2));
+                                if (soSetupResult) soSetupResult.createpoCleared = soCleanResult2;
+                            } catch (cleanErr2) {
+                                log.error("SO_CREATEPO_CLEAR_ERR_FALLBACK", cleanErr2.message);
+                            }
+                        }
+
+                    } catch (soErr) {
+                        // SO update failed — use record.transform (SO → PO) to create a properly linked PO.
+                        log.error("SO_DROPSHIP_FAILED", JSON.stringify({ soId: linkedSoId, error: soErr.message }));
+                        soSetupResult = { success: false, error: soErr.message };
+
+                        // record.transform guarantees createdfrom is set correctly IF lines map over.
+                        // If they don't, we still get a PO but we need to try forcing the link.
+                        var transformErrObj = null;
+                        try {
+                            po = record.transform({
+                                fromType: record.Type.SALES_ORDER,
+                                fromId:   parseInt(linkedSoId, 10),
+                                toType:   record.Type.PURCHASE_ORDER,
+                                isDynamic: true,
+                                defaultValues: { entity: parseInt(vendor_id, 10) }
+                            });
+                            // Force explicit link just in case
+                            try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                        } catch (transformErr2) {
+                            transformErrObj = transformErr2.message;
+                            log.error("TRANSFORM_FAILED_CATCH", transformErr2.message);
+                            po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true });
+                            if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                            try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) {}
+                        }
+                        
+                        isDropshipCreate = true;
+                        if (transformErrObj) {
+                            soSetupResult.transformError = transformErrObj;
+                        }
+
+                        var dsFormId3 = findFormId("Ecomm BP - Purchase Order");
+                        if (dsFormId3) po.setValue({ fieldId: "customform", value: parseInt(dsFormId3, 10) });
+                        if (vendor_id) po.setValue({ fieldId: "entity",    value: parseInt(vendor_id, 10) });
+                        setPOHeaders(po, headerOpts);
+
+                        // Clean up SO — remove Drop Ship from lines (best-effort)
+                        try {
+                            var soCleanResult3 = clearSOCreatePO(linkedSoId);
+                            log.debug("SO_CREATEPO_CLEARED_CATCH", JSON.stringify(soCleanResult3));
+                            soSetupResult.createpoCleared = soCleanResult3;
+                        } catch (cleanErr3) {
+                            log.error("SO_CREATEPO_CLEAR_ERR_CATCH", cleanErr3.message);
+                        }
                     }
-
-                    // Step 3: Create PO — lines auto-populate from updated SO
-                    var poDefaults = {
-                        soid: linkedSoId,
-                        shipgroup: "1",
-                        dropship: "T",
-                        custid: linkedSoCustomerId,
-                        entity: parseInt(vendor_id, 10),
-                        poentity: parseInt(vendor_id, 10)
-                    };
-                    if (soSubsidiary) {
-                        poDefaults.subsidiary = soSubsidiary;
-                    }
-
-                    log.debug("DROPSHIP_DEFAULTS", JSON.stringify(poDefaults));
-
-                    po = record.create({
-                        type: record.Type.PURCHASE_ORDER,
-                        isDynamic: true,
-                        defaultValues: poDefaults
-                    });
-                    isDropshipCreate = true;
-
-                    // Set headers (skip form + entity — already set via defaultValues)
-                    setPOHeaders(po, headerOpts);
                 }
 
             } else if (existing && action === "update") {
@@ -544,8 +737,11 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var linesAdded = 0;
             var linesUpdated = 0;
 
+            // If it's a dropship create but the PO transformed with 0 lines (because 
+            // the SO lines were invalid dropship items), fall through to the STANDARD
+            // add-first strategy to manually insert the lines.
             if (isDropshipCreate && oldLineCount > 0) {
-                // ── DROPSHIP: Lines auto-populated from SO via defaultValues.soid ──
+                // ── DROPSHIP: Lines auto-populated from SO ──
                 // Qty already matches (SO was updated first). Only update rate + location.
                 log.debug("DROPSHIP_LINES", "Auto-populated " + oldLineCount + " lines from SO — updating rate/location only");
 
@@ -610,6 +806,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: newItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: newItem.cost, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "amount", value: newItem.qty * newItem.cost, ignoreFieldChange: false });
+                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) {}
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
                     } catch (addErr) {
@@ -634,16 +831,40 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
             } else {
                 // ── STANDARD: Add-first, remove-old strategy ───────────────────
+                // If this is a fallback Dropship create, we'll try to find the matching SO line
+                // so we can hard-link the PO line to the SO line (orderdoc / orderline).
+                // This is what makes the PO number show up on the SO "Create PO" column.
+                var soLineMap = {};
+                if (linkedSoId) {
+                    try {
+                        var soLookup = record.load({ type: record.Type.SALES_ORDER, id: linkedSoId, isDynamic: false });
+                        var scount = soLookup.getLineCount({ sublistId: "item" });
+                        for (var si = 0; si < scount; si++) {
+                            var sItemId = soLookup.getSublistValue({ sublistId: "item", fieldId: "item", line: si });
+                            var sLineId = soLookup.getSublistValue({ sublistId: "item", fieldId: "line", line: si });
+                            if (!soLineMap[sItemId]) soLineMap[sItemId] = sLineId; // grab first match
+                        }
+                    } catch (e) { log.debug("SO_LINE_LOOKUP_ERR", e.message); }
+                }
+
                 for (var i = 0; i < resolvedItems.length; i++) {
                     var stdItem = resolvedItems[i];
                     try {
                         po.selectNewLine({ sublistId: "item" });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "item", value: stdItem.itemId, ignoreFieldChange: false });
+                        
+                        // 🔗 Hard-link to SO Line
+                        if (linkedSoId && soLineMap[stdItem.itemId]) {
+                            try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "orderdoc", value: linkedSoId, ignoreFieldChange: false }); } catch(e){}
+                            try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "orderline", value: soLineMap[stdItem.itemId], ignoreFieldChange: false }); } catch(e){}
+                        }
+
                         if (locationId) {
                             po.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId, ignoreFieldChange: false });
                         }
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: stdItem.cost, ignoreFieldChange: false });
+                        try { po.setCurrentSublistValue({ sublistId: "item", fieldId: "class", value: "", ignoreFieldChange: true }); } catch (e) {}
                         po.commitLine({ sublistId: "item" });
                         linesAdded++;
                         log.debug("ITEM_ADDED", "SKU \"" + stdItem.sku + "\" → lines now: " + po.getLineCount({ sublistId: "item" }));
@@ -677,12 +898,49 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 };
             }
 
+            // ── Set shipping address ─────────────────────────────────────────
+            var shipResult = null;
+            if (po_type === "Dropship" && linkedSoId) {
+                shipResult = copySOShippingToPO(linkedSoId, po);
+            } else if (po_type === "Stocking" && locationId) {
+                shipResult = setStockingShipAddress(po, locationId);
+            }
+            if (shipResult) log.debug("SHIP_ADDRESS", JSON.stringify(shipResult));
+
+            // ── Clear auto-sourced class to avoid subsidiary mismatch ────────
+            try { po.setValue({ fieldId: "class", value: "" }); } catch (e) {}
+
             // ── SNAPSHOT: AFTER (before save) ────────────────────────────────
             after = snapshotPO(po);
             diff = diffSnapshots(before, after);
 
-            var savedId = po.save({ enableSourcing: true, ignoreMandatoryFields: true });
+            var savedId = po.save({ enableSourcing: false, ignoreMandatoryFields: true });
             log.debug("SUCCESS", "PO " + po_number + " saved → ID: " + savedId);
+
+            // Verify createdfrom link via search (same pattern as support script)
+            var createdfromResult = null;
+            if (linkedSoId) {
+                try {
+                    var cfSearch = search.create({
+                        type: search.Type.PURCHASE_ORDER,
+                        filters: [
+                            ["createdfrom", "anyof", linkedSoId],
+                            "AND",
+                            ["internalid", "anyof", savedId]
+                        ],
+                        columns: ["internalid"]
+                    });
+                    var cfResults = cfSearch.run().getRange({ start: 0, end: 1 });
+                    createdfromResult = {
+                        linked: cfResults.length > 0,
+                        soId: linkedSoId,
+                        poId: savedId
+                    };
+                    log.debug("CREATEDFROM_VERIFY", JSON.stringify(createdfromResult));
+                } catch (vErr) {
+                    createdfromResult = { error: vErr.message };
+                }
+            }
 
             return {
                 success: true,
@@ -696,6 +954,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 skippedSkus: skippedSkus.length > 0 ? skippedSkus : undefined,
                 soSetup: soSetupResult,
                 autoPO: autoPOInfo,
+                createdfromResult: createdfromResult,
                 linkedSo: linkedSoId ? { id: linkedSoId, soNumber: linkedSoNumber } : null,
                 before: before, after: after, diff: diff
             };
