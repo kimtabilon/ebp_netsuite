@@ -44,26 +44,28 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
         .toArray();
 
     // ── Phase 2: Dropship POs (only if SO is synced) ────────────────────
-    const dropshipCandidates = await collection
-        .find({ ...baseFilter, po_type: "Dropship", website_order_number: { $exists: true, $ne: "" } })
-        .limit(DROPSHIP_BATCH * 2)  // fetch extra — some may not have synced SOs
+    // Strategy: find synced SO order numbers first, then fetch matching POs.
+    // Old approach fetched first N POs and hoped some had synced SOs — failed
+    // when early POs in natural order all lacked synced SOs.
+    let dropshipOrders: any[] = [];
+    const syncedSOs = await soCollection
+        .find({ ns_synced: true, ns_result: "created" })
+        .project({ otherrefnum: 1 })
         .toArray();
 
-    // Filter to only those whose SO is synced
-    let dropshipOrders: any[] = [];
-    if (dropshipCandidates.length > 0) {
-        const orderNumbers = dropshipCandidates.map((p: any) => p.website_order_number);
-        const syncedSOs = await soCollection
-            .find({ otherrefnum: { $in: orderNumbers }, ns_synced: true, ns_result: "created" })
-            .project({ otherrefnum: 1 })
+    if (syncedSOs.length > 0) {
+        const syncedOrderNumbers = syncedSOs.map((s: any) => s.otherrefnum);
+
+        dropshipOrders = await collection
+            .find({
+                ...baseFilter,
+                po_type: "Dropship",
+                website_order_number: { $in: syncedOrderNumbers }
+            })
+            .limit(DROPSHIP_BATCH)
             .toArray();
-        const syncedSet = new Set(syncedSOs.map((s: any) => s.otherrefnum));
 
-        dropshipOrders = dropshipCandidates
-            .filter((p: any) => syncedSet.has(p.website_order_number))
-            .slice(0, DROPSHIP_BATCH);
-
-        log.info(`[NS PO Sync] Dropship: ${dropshipCandidates.length} candidates, ${syncedSOs.length} with synced SO, ${dropshipOrders.length} ready`);
+        log.info(`[NS PO Sync] Dropship: ${syncedSOs.length} synced SOs, ${dropshipOrders.length} POs ready`);
     }
 
     const orders = [...stockingOrders, ...dropshipOrders];

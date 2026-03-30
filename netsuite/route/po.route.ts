@@ -200,6 +200,134 @@ router.get("/dropship-ready", async (_req: any, res: any) => {
     }
 });
 
+// ─── PO Sync Status (counts by type + sync state) ───────────────────────────
+router.get("/po-sync-status", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const poColl = nsDb.collection("suite_purchase_order");
+        const soColl = nsDb.collection("suite_sales_order");
+
+        // Total counts by type
+        const totalStocking = await poColl.countDocuments({ po_type: { $ne: "Dropship" } });
+        const totalDropship = await poColl.countDocuments({ po_type: "Dropship" });
+
+        // Synced counts
+        const syncedStocking = await poColl.countDocuments({ po_type: { $ne: "Dropship" }, ns_synced: true });
+        const syncedDropship = await poColl.countDocuments({ po_type: "Dropship", ns_synced: true });
+
+        // Failed counts
+        const failedStocking = await poColl.countDocuments({ po_type: { $ne: "Dropship" }, ns_failed: true });
+        const failedDropship = await poColl.countDocuments({ po_type: "Dropship", ns_failed: true });
+
+        // Unsynced counts
+        const unsyncedStocking = await poColl.countDocuments({ po_type: { $ne: "Dropship" }, ns_synced: { $ne: true }, ns_failed: { $ne: true } });
+        const unsyncedDropship = await poColl.countDocuments({ po_type: "Dropship", ns_synced: { $ne: true }, ns_failed: { $ne: true } });
+
+        // Dropship POs whose SO is synced in ERP (ready to sync)
+        const dropshipCandidates = await poColl
+            .find({ po_type: "Dropship", ns_synced: { $ne: true }, ns_failed: { $ne: true }, website_order_number: { $exists: true, $ne: "" } })
+            .project({ website_order_number: 1 })
+            .toArray();
+
+        let dropshipReady = 0;
+        let dropshipWaitingForSO = 0;
+        if (dropshipCandidates.length > 0) {
+            const orderNumbers = dropshipCandidates.map((p: any) => p.website_order_number);
+            const syncedSOs = await soColl
+                .find({ otherrefnum: { $in: orderNumbers }, ns_synced: true, ns_result: "created" })
+                .project({ otherrefnum: 1 })
+                .toArray();
+            const syncedSet = new Set(syncedSOs.map((s: any) => s.otherrefnum));
+            dropshipReady = dropshipCandidates.filter((p: any) => syncedSet.has(p.website_order_number)).length;
+            dropshipWaitingForSO = unsyncedDropship - dropshipReady;
+        } else {
+            dropshipWaitingForSO = unsyncedDropship;
+        }
+
+        res.json({
+            success: true,
+            total: totalStocking + totalDropship,
+            stocking: { total: totalStocking, synced: syncedStocking, unsynced: unsyncedStocking, failed: failedStocking },
+            dropship: {
+                total: totalDropship, synced: syncedDropship, unsynced: unsyncedDropship, failed: failedDropship,
+                ready: dropshipReady, waiting_for_so: dropshipWaitingForSO,
+            },
+        });
+    } catch (e: any) {
+        log.error("[PO-SYNC-STATUS] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ─── Debug: trace sync-po logic step by step ────────────────────────────────
+router.get("/po-sync-debug", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const poColl = nsDb.collection("suite_purchase_order");
+        const soColl = nsDb.collection("suite_sales_order");
+
+        const baseFilter = { ns_synced: { $ne: true }, ns_failed: { $ne: true } };
+
+        const stockingCount = await poColl.countDocuments({ ...baseFilter, po_type: { $ne: "Dropship" } });
+
+        const dropshipFilter = { ...baseFilter, po_type: "Dropship", website_order_number: { $exists: true, $ne: "" } };
+        const dropshipCount = await poColl.countDocuments(dropshipFilter);
+
+        const dropshipCandidates = await poColl
+            .find(dropshipFilter)
+            .limit(140)
+            .project({ website_order_number: 1, po_number: 1 })
+            .toArray();
+
+        let syncedSOCount = 0;
+        let readyCount = 0;
+        let sampleCandidates: any[] = [];
+        let sampleSOs: any[] = [];
+
+        if (dropshipCandidates.length > 0) {
+            sampleCandidates = dropshipCandidates.slice(0, 5);
+            const orderNumbers = dropshipCandidates.map((p: any) => p.website_order_number);
+
+            // Check with the exact filter used in po.sync.ts
+            const syncedSOs = await soColl
+                .find({ otherrefnum: { $in: orderNumbers }, ns_synced: true, ns_result: "created" })
+                .project({ otherrefnum: 1, ns_result: 1 })
+                .toArray();
+            syncedSOCount = syncedSOs.length;
+
+            const syncedSet = new Set(syncedSOs.map((s: any) => s.otherrefnum));
+            readyCount = dropshipCandidates.filter((p: any) => syncedSet.has(p.website_order_number)).length;
+
+            // Also check: what ns_result values do matching SOs actually have?
+            const allMatchingSOs = await soColl
+                .find({ otherrefnum: { $in: orderNumbers.slice(0, 20) } })
+                .project({ otherrefnum: 1, ns_synced: 1, ns_result: 1 })
+                .toArray();
+            sampleSOs = allMatchingSOs.slice(0, 10);
+        }
+
+        // Also check: what ns_result values exist across all synced SOs?
+        const soResultDistribution = await soColl.aggregate([
+            { $match: { ns_synced: true } },
+            { $group: { _id: "$ns_result", count: { $sum: 1 } } }
+        ]).toArray();
+
+        res.json({
+            baseFilter,
+            stocking_matching: stockingCount,
+            dropship_matching: dropshipCount,
+            dropship_candidates_fetched: dropshipCandidates.length,
+            sample_candidates: sampleCandidates,
+            synced_sos_matching_candidates: syncedSOCount,
+            ready_to_sync: readyCount,
+            sample_sos: sampleSOs,
+            so_result_distribution: soResultDistribution,
+        });
+    } catch (e: any) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // ─── Delete All POs ─────────────────────────────────────────────────────────
 // GET  /delete-all-po → dry-run
 // POST /delete-all-po → delete
