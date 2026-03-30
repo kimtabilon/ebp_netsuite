@@ -17,7 +17,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 2222 
           script: |
-            cd /ebpconsole/ebp_netsuite
+            cd ~/ebpconsole/ebp_netsuite
             git stash
             git pull origin
             # git reset --hard origin/main
