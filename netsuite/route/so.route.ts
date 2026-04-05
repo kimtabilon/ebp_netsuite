@@ -233,7 +233,7 @@ router.post("/reset-so-sync", async (_req: any, res: any) => {
 });
 
 // Reset only orders that failed with ns_result: "no_items"
-// GET  /reset-no-items  → dry-run (count only)
+// GET  /reset-no-items  → dry-run (count only)ƒrese
 // POST /reset-no-items  → actually reset
 router.get("/reset-no-items", async (_req: any, res: any) => {
     try {
@@ -263,6 +263,65 @@ router.post("/reset-no-items", async (_req: any, res: any) => {
         res.status(500).json({ success: false, error: e.message });
     }
 });
+
+
+// ─── Reset orders that failed with known RESTlet errors (channel / line-item) ─
+// These were failing because of bugs now fixed in the RESTlet.
+// GET  /reset-errored-so  → dry-run (shows count + sample errors)
+// POST /reset-errored-so  → clears ns_error, ns_failed, ns_retry_count so they retry
+const RETRIABLE_ERROR_PATTERNS = [
+    "Channels/Lead Source",
+    "valid line item",
+    "VALID_LINE_ITEM_REQD",
+    "USER_ERROR",
+];
+router.get("/reset-errored-so", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        // Find orders with any of the known retriable error patterns
+        const orFilter = RETRIABLE_ERROR_PATTERNS.map(p => ({ ns_error: { $regex: p, $options: "i" } }));
+        const count = await col.countDocuments({ $or: orFilter });
+        const samples = await col.find({ $or: orFilter }, {
+            projection: { otherrefnum: 1, ns_error: 1, ns_retry_count: 1, order_source: 1, store_type: 1 }
+        }).limit(10).toArray();
+        res.json({
+            success: true, action: "dry_run",
+            retriable_count: count,
+            error_patterns: RETRIABLE_ERROR_PATTERNS,
+            sample_orders: samples,
+            hint: "POST /api/v4/reset-errored-so to reset these for retry"
+        });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+router.post("/reset-errored-so", async (_req: any, res: any) => {
+    try {
+        const nsDb = await getDb("netsuite");
+        const col = nsDb.collection("suite_sales_order");
+        const orFilter = RETRIABLE_ERROR_PATTERNS.map(p => ({ ns_error: { $regex: p, $options: "i" } }));
+        const result = await col.updateMany(
+            { $or: orFilter },
+            {
+                $set:  { ns_synced: false },
+                $unset: { ns_error: "", ns_error_at: "", ns_retry_count: "", ns_failed: "" }
+            }
+        );
+        log.info(`[RESET-ERRORED-SO] Reset ${result.modifiedCount} errored orders for retry`);
+        res.json({
+            success: true, action: "reset",
+            matched: result.matchedCount,
+            modified: result.modifiedCount,
+            message: `${result.modifiedCount} orders reset — they will retry on the next sync cycle`
+        });
+    } catch (e: any) {
+        log.error("[RESET-ERRORED-SO] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 
 // Re-stage Walmart orders with corrupt trandate (year > 2030 or ns_failed)
 // GET  /restage-walmart  → dry-run (count only)
