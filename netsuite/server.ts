@@ -24,6 +24,9 @@ dotenv.config();
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
+app.get('/' , (req, res) => {
+    res.send('NetSuite Integration Server is running');
+})
 app.use("/api/v4", soRoutes);
 app.use("/api/v4", poRoutes);
 app.use("/api/v4", billRoutes);
@@ -112,26 +115,26 @@ cron.schedule("30 1,4,7,10,13,16,19,22 * * *", runSOSync);  // odd hours :30
 // PO at :07, :27, :47 — 7-min offset from SO to avoid API overlap.
 // Governance per PO: Stocking ~42 units, Dropship ~77 units (RESTlet limit 5,000)
 // Batches: 50 stocking + 20 dropship per cron run, 5 parallel workers
-let poSyncRunning = false;
+// let poSyncRunning = false;
 
-cron.schedule("7,27,47 * * * *", async () => {
-    if (poSyncRunning) {
-        log.warn("[CRON] [PO] Skipping — previous sync still running");
-        return;
-    }
-    poSyncRunning = true;
-    try {
-        log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
-        await stagePurchaseOrders();
+// cron.schedule("7,27,47 * * * *", async () => {
+//     if (poSyncRunning) {
+//         log.warn("[CRON] [PO] Skipping — previous sync still running");
+//         return;
+//     }
+//     poSyncRunning = true;
+//     try {
+//         log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
+//         await stagePurchaseOrders();
 
-        log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-        await syncPurchaseOrdersToNetsuite();
-    } catch (err: any) {
-        log.error("[CRON] [PO] Error", { error: err.message });
-    } finally {
-        poSyncRunning = false;
-    }
-});
+//         log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
+//         await syncPurchaseOrdersToNetsuite();
+//     } catch (err: any) {
+//         log.error("[CRON] [PO] Error", { error: err.message });
+//     } finally {
+//         poSyncRunning = false;
+//     }
+// });
 
 // ─── Every 20 min — Bill sync offset from PO ─────────────────────────────
 // SO at :00/:30 → PO at :07/:27/:47 → Bill at :14/:34/:54

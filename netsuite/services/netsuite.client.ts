@@ -9,6 +9,8 @@ const buildRestletUrl = (scriptId: string, deployId: string): string => {
     if (!accountId) throw new Error("NS_ACCOUNT_ID is not set in .env");
     const accountUrl = accountId.toLowerCase().replace(/_/g, "-");
     return `https://${accountUrl}.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=${scriptId}&deploy=${deployId}`;
+    // return "https://9511322.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=customscriptebp_sales_order_sync&deploy=customdeploy4";
+
 };
 
 const buildOAuthHeader = (url: string, method: string): string => {

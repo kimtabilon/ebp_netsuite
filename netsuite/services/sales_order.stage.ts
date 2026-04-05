@@ -43,7 +43,7 @@ interface SalesOrder {
     items_shipped: number;
     items_unshipped: number;
     items: SalesItem[];
-    po: SimplePO[];
+    // po: SimplePO[];
     shipping_address: ShippingAddress | null;
 }
 
@@ -77,7 +77,7 @@ function buildAmazonOrders(
                 quantity: Number(i?.QuantityOrdered || 0),
                 amount:   Number(i?.ItemPrice?.Amount || 0)
             })),
-            po: po_map.get(orderId) || [],
+            // po: po_map.get(orderId) || [],
             shipping_address: addr ? {
                 addressee: addr.Name || "",
                 company:   addr.CompanyName || "",
@@ -123,7 +123,7 @@ function buildNeweggOrders(
                     amount:   Number(i?.UnitPrice || (itemList.length === 1 ? orderAmount : 0)),
                 }))
                 : [],
-            po: po_map.get(orderId) || [],
+            // po: po_map.get(orderId) || [],
             shipping_address: {
                 addressee: [order.ShipToFirstName, order.ShipToLastName].filter(Boolean).join(" "),
                 company:   order.ShipToCompany || "",
@@ -193,7 +193,7 @@ function buildWalmartOrders(
             items_shipped:      topStatus === "Delivered" || topStatus === "Shipped" ? items.length : 0,
             items_unshipped:    topStatus === "Delivered" || topStatus === "Shipped" ? 0 : items.length,
             items,
-            po: po_map.get(orderId) || [],
+            // po: po_map.get(orderId) || [],
             shipping_address: addr ? {
                 addressee: addr.name || "",
                 company:   "",
@@ -230,10 +230,10 @@ function buildTpxOrders(
         // Items from order_items[]
         const rawItems = Array.isArray(order.order_items) ? order.order_items : [];
         const items: SalesItem[] = rawItems.map((i: any) => ({
-            item:     i?.Name || "",
-            quantity: Number(i?.Quantity || 1),
-            amount:   Number(i?.Amount || 0),
-        }));
+    item:     i?.SKU || i?.ItemSKU || i?.sku || i?.Name || "",  // check your actual TPX doc structure
+    quantity: Number(i?.Quantity || 1),
+    amount:   Number(i?.Amount || 0),
+}));
 
         // Ship date from shipping_details.ShipDate
         const shipDate = order.shipping_details?.ShipDate || null;
@@ -252,7 +252,7 @@ function buildTpxOrders(
             items_shipped:      order.shipped ? items.length : 0,
             items_unshipped:    order.shipped ? 0 : items.length,
             items,
-            po: po_map.get(orderId) || [],
+            // po: po_map.get(orderId) || [],
             shipping_address: addr ? {
                 addressee: addr.Name || "",
                 company:   addr.Company || "",
