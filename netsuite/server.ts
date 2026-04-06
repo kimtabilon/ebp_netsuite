@@ -87,54 +87,54 @@ app.listen(PORT, () => {
 // 90 min = two cron entries sharing one guard.
 // Runs at: 0:00, 1:30, 3:00, 4:30, 6:00, 7:30, 9:00, 10:30,
 //          12:00, 13:30, 15:00, 16:30, 18:00, 19:30, 21:00, 22:30
-let soSyncRunning = false;
+// let soSyncRunning = false;
 
-async function runSOSync() {
-    if (soSyncRunning) {
-        log.warn("[CRON] [SO] Skipping — previous sync still running");
-        return;
-    }
-    soSyncRunning = true;
-    try {
-        log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-        await stageSalesOrders();
+// async function runSOSync() {
+//     if (soSyncRunning) {
+//         log.warn("[CRON] [SO] Skipping — previous sync still running");
+//         return;
+//     }
+//     soSyncRunning = true;
+//     try {
+//         log.info("[CRON] [SO] Step 1 — Staging sales orders...");
+//         await stageSalesOrders();
 
-        log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-        await syncSalesOrdersToNetsuite();
-    } catch (err: any) {
-        log.error("[CRON] [SO] Error", { error: err.message });
-    } finally {
-        soSyncRunning = false;
-    }
-}
+//         log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
+//         await syncSalesOrdersToNetsuite();
+//     } catch (err: any) {
+//         log.error("[CRON] [SO] Error", { error: err.message });
+//     } finally {
+//         soSyncRunning = false;
+//     }
+// }
 
-cron.schedule("0 0,3,6,9,12,15,18,21 * * *", runSOSync);   // even hours :00
-cron.schedule("30 1,4,7,10,13,16,19,22 * * *", runSOSync);  // odd hours :30
+// cron.schedule("0 0,3,6,9,12,15,18,21 * * *", runSOSync);   // even hours :00
+// cron.schedule("30 1,4,7,10,13,16,19,22 * * *", runSOSync);  // odd hours :30
 
 // ─── Every 20 min — Purchase Orders (staging + sync) ──────────────────────
 // PO at :07, :27, :47 — 7-min offset from SO to avoid API overlap.
 // Governance per PO: Stocking ~42 units, Dropship ~77 units (RESTlet limit 5,000)
 // Batches: 50 stocking + 20 dropship per cron run, 5 parallel workers
-// let poSyncRunning = false;
+let poSyncRunning = false;
 
-// cron.schedule("7,27,47 * * * *", async () => {
-//     if (poSyncRunning) {
-//         log.warn("[CRON] [PO] Skipping — previous sync still running");
-//         return;
-//     }
-//     poSyncRunning = true;
-//     try {
-//         log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
-//         await stagePurchaseOrders();
+cron.schedule("7,27,47 * * * *", async () => {
+    if (poSyncRunning) {
+        log.warn("[CRON] [PO] Skipping — previous sync still running");
+        return;
+    }
+    poSyncRunning = true;
+    try {
+        log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
+        await stagePurchaseOrders();
 
-//         log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-//         await syncPurchaseOrdersToNetsuite();
-//     } catch (err: any) {
-//         log.error("[CRON] [PO] Error", { error: err.message });
-//     } finally {
-//         poSyncRunning = false;
-//     }
-// });
+        log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
+        await syncPurchaseOrdersToNetsuite();
+    } catch (err: any) {
+        log.error("[CRON] [PO] Error", { error: err.message });
+    } finally {
+        poSyncRunning = false;
+    }
+});
 
 // ─── Every 20 min — Bill sync offset from PO ─────────────────────────────
 // SO at :00/:30 → PO at :07/:27/:47 → Bill at :14/:34/:54
