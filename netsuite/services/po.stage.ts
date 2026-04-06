@@ -1,6 +1,20 @@
 import { getDb } from "../config/mongdodb.config";
 import log from "../config/logger.config";
 
+// ── Warehouse map: stocking_warehouse code → NetSuite location name ──
+// These must match the WAREHOUSE_MAP in purchase_order_restlet.js
+// All 5 warehouses: MW (California), W2G-PA (PA), W2G-IL (IL), W2G-KY (KY), W2G-TX (TX)
+const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
+    "MW":     { netsuiteName: "California - Chatsworth", address: "21540 Prairie Street, Suite F, Chatsworth CA 91311" },
+    "W2G-PA": { netsuiteName: "Ware2Go - PA (Fairless Hills)", address: "1 Kresge Road, Fairless Hills, PA 19030" },
+    "W2G-IL": { netsuiteName: "Ware2Go - IL (Batavia)", address: "1206 NAGEL BLVD, Batavia, IL 60510" },
+    "W2G-KY": { netsuiteName: "Ware2Go - KY (Hebron)", address: "Hebron, KY" },
+    "W2G-TX": { netsuiteName: "Ware2Go - TX (Grapevine)", address: "2450 Esters Blvd #100, Grapevine, TX 76051" }
+};
+
+// Valid warehouse codes for quick lookup
+const VALID_WAREHOUSE_CODES = Object.keys(WAREHOUSE_MAP);
+
 // Distributor (DB value) + payment_type → { vendor name, NetSuite vendor ID }
 // Default = non-DLL variant (NET/TERM)
 const VENDOR_MAP: Record<string, { default: { name: string; id: number }; dll: { name: string; id: number } }> = {
@@ -26,7 +40,7 @@ const VENDOR_MAP: Record<string, { default: { name: string; id: number }; dll: {
     }
 };
 
-function resolveVendor(distributor: string, payment_type: string): { name: string; id: number | null } {
+export function resolveVendor(distributor: string, payment_type: string): { name: string; id: number | null } {
     const key = (distributor || "").trim().toLowerCase();
     const isDLL = (payment_type || "").trim().toUpperCase() === "DLL";
 
@@ -37,6 +51,43 @@ function resolveVendor(distributor: string, payment_type: string): { name: strin
     }
 
     return isDLL ? entry.dll : entry.default;
+}
+
+// ── Warehouse validation ────────────────────────────────────────────────────
+// Returns null if warehouse is invalid or missing (for dropship)
+// Returns the original code if valid
+// Logs a warning for invalid warehouse codes
+export function validateWarehouse(
+    stockingWarehouse: string,
+    poType: string,
+    poNumber: number
+): string {
+    const warehouse = (stockingWarehouse || "").trim();
+
+    // Dropship POs don't need a warehouse (ship to customer)
+    if (poType === "Dropship") {
+        return "";
+    }
+
+    // For stocking POs, warehouse is required
+    if (poType === "Stocking") {
+        if (!warehouse) {
+            log.warn(`[PO Stage] PO ${poNumber} is Stocking but has no stocking_warehouse — will fail in NetSuite`);
+            return "";
+        }
+
+        if (!VALID_WAREHOUSE_CODES.includes(warehouse)) {
+            log.warn(`[PO Stage] PO ${poNumber} has invalid warehouse code: "${warehouse}" — must be one of: ${VALID_WAREHOUSE_CODES.join(", ")}`);
+            return warehouse; // Still pass through, will fail in NetSuite with clear error
+        }
+
+        const whInfo = WAREHOUSE_MAP[warehouse];
+        log.debug(`[PO Stage] PO ${poNumber} validated: ${warehouse} → ${whInfo.netsuiteName} (${whInfo.address})`);
+        return warehouse;
+    }
+
+    // Unknown po_type — return as-is
+    return warehouse;
 }
 
 interface POItem {
@@ -84,6 +135,13 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
         // Resolve vendor from distributor + payment_type (e.g. "dandh" + "DLL" → D&H - DLL, 118)
         const vendor = resolveVendor(po.distributor, po.payment_type);
 
+        // Validate warehouse for stocking POs
+        const validatedWarehouse = validateWarehouse(
+            po.stocking_warehouse,
+            po.po_type,
+            po.po_number
+        );
+
         if (!po.po_type) {
             log.warn(`[PO Stage] PO ${po.po_number} has no po_type — will not trigger Dropship flow`);
         }
@@ -99,7 +157,7 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
             tracking:                 po.tracking ?? null,
             order_items:              po.order_items || [],
             po_type:                  po.po_type                  || "",
-            stocking_warehouse:       po.stocking_warehouse       || "",
+            stocking_warehouse:       validatedWarehouse,
             created_at:               po.created_at  || "",
             updated_at:               po.updated_at  || ""
         });

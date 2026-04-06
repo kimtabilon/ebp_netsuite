@@ -33,19 +33,69 @@
  * @NApiVersion 2.1
  * @NScriptType Restlet
  */
-define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search, log, runtime) {
+define(["N/record", "N/search", "N/log", "N/runtime" , "N/query"], function (record, search, log, runtime, query) {
 
     // ── Caches ─────────────────────────────────────────────────────────────
     var _formCache = {};
     var _locationCache = {};
 
     // ── Warehouse map: stocking_warehouse code → NetSuite location name ──
+    // UPDATED: Corrected city names to match actual warehouse addresses
     var WAREHOUSE_MAP = {
-        "MW": "California - Chatsworth",
-        "W2G-PA": "Ware2Go - PA (Fairless Hills)",
-        "W2G-IL": "Ware2Go - IL (Aurora)",
-        "W2G-KY": "Ware2Go - KY (Hebron)",
-        "W2G-TX": "Ware2Go - TX (Dallas)"
+        "MW": "California - Chatsworth",           // 21540 Prairie Street, Suite F, Chatsworth CA 91311
+        "W2G-PA": "Ware2Go - PA (Fairless Hills)", // 1 Kresge Road, Fairless Hills, PA 19030
+        "W2G-IL": "Ware2Go - IL (Aurora)",         // 1206 NAGEL BLVD, Batavia, IL 60510 (Aurora in NS)
+        "W2G-KY": "Ware2Go - KY (Hebron)",         // Hebron, KY
+        "W2G-TX": "Ware2Go - TX (Dallas)"       // 2450 Esters Blvd #100, Grapevine, TX 76051 (Dallas in NS)
+    };
+
+    // ── Warehouse address map for direct address entry ──────────────────
+    var WAREHOUSE_ADDRESS_MAP = {
+        "MW": {
+            addressee: "California - Chatsworth",
+            addr1: "21540 Prairie Street",
+            addr2: "Suite F",
+            city: "Chatsworth",
+            state: "CA",
+            zip: "91311",
+            country: "US"
+        },
+        "W2G-PA": {
+            addressee: "Ware2Go - PA (Fairless Hills)",
+            addr1: "1 Kresge Road",
+            addr2: "",
+            city: "Fairless Hills",
+            state: "PA",
+            zip: "19030",
+            country: "US"
+        },
+        "W2G-IL": {
+            addressee: "Ware2Go - IL (Aurora)",
+            addr1: "1206 NAGEL BLVD",
+            addr2: "",
+            city: "Batavia",
+            state: "IL",
+            zip: "60510",
+            country: "US"
+        },
+        "W2G-KY": {
+            addressee: "Ware2Go - KY (Hebron)",
+            addr1: "Hebron",
+            addr2: "",
+            city: "Hebron",
+            state: "KY",
+            zip: "",
+            country: "US"
+        },
+        "W2G-TX": {
+            addressee: "Ware2Go - TX (Dallas)",
+            addr1: "2450 Esters Blvd",
+            addr2: "#100",
+            city: "Grapevine",
+            state: "TX",
+            zip: "76051",
+            country: "US"
+        }
     };
 
     // ── Snapshot helpers (mirror SO RESTlet pattern) ─────────────────────
@@ -54,7 +104,7 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
         var headerFields = [
             "customform", "entity", "subsidiary", "otherrefnum",
             "trandate", "currency", "custbody1", "custbody2",
-            "custbody_otherrefnumber_custom"
+            "custbody_otherrefnumber_custom", "createdfrom"
         ];
         for (var hi = 0; hi < headerFields.length; hi++) {
             try {
@@ -224,11 +274,27 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
     }
 
     // ── Set PO ship-to = warehouse location (Stocking) ──────────────────
-    function setStockingShipAddress(po, locationId) {
+    function setStockingShipAddress(po, stockingWarehouse) {
         try {
-            po.setValue({ fieldId: "shipaddresslist", value: parseInt(locationId, 10) });
-            log.debug("STOCKING_SHIP_ADDR", "Set shipaddresslist to location " + locationId);
-            return { success: true, locationId: locationId };
+            var addr = WAREHOUSE_ADDRESS_MAP[stockingWarehouse];
+            if (!addr) {
+                return { success: false, error: "No address mapping for warehouse: " + stockingWarehouse };
+            }
+
+            // Clear shipaddresslist to enable custom address entry
+            po.setValue({ fieldId: "shipaddresslist", value: "" });
+
+            var poShip = po.getSubrecord({ fieldId: "shippingaddress" });
+            poShip.setValue({ fieldId: "country", value: addr.country });
+            poShip.setValue({ fieldId: "addressee", value: addr.addressee });
+            poShip.setValue({ fieldId: "addr1", value: addr.addr1 });
+            if (addr.addr2) poShip.setValue({ fieldId: "addr2", value: addr.addr2 });
+            poShip.setValue({ fieldId: "city", value: addr.city });
+            poShip.setValue({ fieldId: "state", value: addr.state });
+            poShip.setValue({ fieldId: "zip", value: addr.zip });
+
+            log.debug("STOCKING_SHIP_ADDR", "Set shipping address for warehouse " + stockingWarehouse);
+            return { success: true, warehouse: stockingWarehouse, address: addr };
         } catch (e) {
             log.debug("STOCKING_SHIP_ADDR_ERR", e.message);
             return { success: false, error: e.message };
@@ -494,8 +560,8 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
                         resolvedItems.push({
                             sku: rawSku,
                             itemId: riId,
-                            qty: parseInt(rawItem.qty, 10) || 1,
-                            cost: parseFloat(rawItem.cost) || 0
+                            qty: parseInt(rawItem.qty || rawItem.quantity, 10) || 1,
+                            cost: parseFloat(rawItem.cost || rawItem.amount) || 0
                         });
                     } catch (lookErr) {
                         log.error("ITEM_LOOKUP_ERR", "SKU \"" + rawSku + "\" — " + lookErr.message);
@@ -541,6 +607,11 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
 
                     // Set headers + snapshot
                     setPOHeaders(po, headerOpts);
+                    // Set header location for Dropship
+                    if (locationId) {
+                        po.setValue({ fieldId: "location", value: locationId });
+                        log.debug("HEADER_LOCATION_SET", "Dropship PO location → " + locationId);
+                    }
 
                 } else {
                     // ── No auto-PO yet — update SO to trigger auto-PO via createpo='DropShip' ──
@@ -601,9 +672,13 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
                             po = record.load({ type: record.Type.PURCHASE_ORDER, id: autoPOInfo.id, isDynamic: true });
                             isUpdate = true;
 
-                            var dsFormId = findFormId("Ecomm BP - Purchase Order");
                             if (dsFormId) po.setValue({ fieldId: "customform", value: parseInt(dsFormId, 10) });
                             if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                            // Set header location
+                            if (locationId) {
+                                po.setValue({ fieldId: "location", value: locationId });
+                                log.debug("HEADER_LOCATION_SET", "Auto-PO location → " + locationId);
+                            }
                             setPOHeaders(po, headerOpts);
 
                             // ── Step 4: Clean up SO — clear createpo + povendor ──────────
@@ -645,6 +720,11 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
                             var dsFormId2 = findFormId("Ecomm BP - Purchase Order");
                             if (dsFormId2) po.setValue({ fieldId: "customform", value: parseInt(dsFormId2, 10) });
                             if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                            // Set header location
+                            if (locationId) {
+                                po.setValue({ fieldId: "location", value: locationId });
+                                log.debug("HEADER_LOCATION_SET", "Transform PO location → " + locationId);
+                            }
                             setPOHeaders(po, headerOpts);
 
                             // Clean up SO — remove Drop Ship from lines (best-effort)
@@ -692,6 +772,11 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
                         var dsFormId3 = findFormId("Ecomm BP - Purchase Order");
                         if (dsFormId3) po.setValue({ fieldId: "customform", value: parseInt(dsFormId3, 10) });
                         if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                        // Set header location
+                        if (locationId) {
+                            po.setValue({ fieldId: "location", value: locationId });
+                            log.debug("HEADER_LOCATION_SET", "Catch transform PO location → " + locationId);
+                        }
                         setPOHeaders(po, headerOpts);
 
                         // Clean up SO — remove Drop Ship from lines (best-effort)
@@ -717,6 +802,11 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
                 }
                 if (vendor_id) {
                     po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
+                }
+                // Set header location for existing PO update
+                if (locationId) {
+                    po.setValue({ fieldId: "location", value: locationId });
+                    log.debug("HEADER_LOCATION_SET", "Updated PO location → " + locationId);
                 }
                 setPOHeaders(po, headerOpts);
 
@@ -748,7 +838,24 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
                 if (vendor_id) {
                     po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
                 }
+                // Set header location if we have one
+                if (locationId) {
+                    po.setValue({ fieldId: "location", value: locationId });
+                    log.debug("HEADER_LOCATION_SET", "PO location → " + locationId);
+                }
                 setPOHeaders(po, headerOpts);
+            }
+
+            // ── Set shipping address for Stocking POs ─────────────────────────
+            var shipResult = null;
+            if (po_type === "Stocking" && stocking_warehouse) {
+                shipResult = setStockingShipAddress(po, stocking_warehouse);
+                log.debug("STOCKING_SHIP_RESULT", JSON.stringify(shipResult));
+            }
+            // ── Copy shipping address from SO for Dropship POs ──────────────
+            if (po_type === "Dropship" && linkedSoId) {
+                shipResult = copySOShippingToPO(linkedSoId, po);
+                log.debug("DROPSHIP_SHIP_RESULT", JSON.stringify(shipResult));
             }
 
             var poSubsidiary = "";
@@ -891,6 +998,7 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
 
                         if (locationId) {
                             po.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId, ignoreFieldChange: false });
+                            log.debug("LINE_LOCATION_SET", "SKU " + stdItem.sku + " location → " + locationId);
                         }
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: stdItem.qty, ignoreFieldChange: false });
                         po.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: stdItem.cost, ignoreFieldChange: false });
@@ -977,6 +1085,7 @@ define(["N/record", "N/search", "N/log", "N/runtime"], function (record, search,
                 autoPO: autoPOInfo,
                 createdfromResult: createdfromResult,
                 linkedSo: linkedSoId ? { id: linkedSoId, soNumber: linkedSoNumber } : null,
+                shipResult: shipResult,
                 before: before, after: after, diff: diff
             };
 

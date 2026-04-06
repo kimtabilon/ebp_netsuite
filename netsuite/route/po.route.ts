@@ -2,8 +2,17 @@ import { Router } from "express";
 import log from "../config/logger.config";
 import { getDb } from "../config/mongdodb.config";
 import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "../services/po.sync";
-import { stagePurchaseOrders } from "../services/po.stage";
+import { stagePurchaseOrders, resolveVendor, validateWarehouse } from "../services/po.stage";
 import { postToNetsuiteForPO } from "../services/netsuite.client";
+
+// ── Warehouse map with addresses for logging ───────────────────────────────
+const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
+    "MW":     { netsuiteName: "California - Chatsworth", address: "21540 Prairie Street, Suite F, Chatsworth CA 91311" },
+    "W2G-PA": { netsuiteName: "Ware2Go - PA (Fairless Hills)", address: "1 Kresge Road, Fairless Hills, PA 19030" },
+    "W2G-IL": { netsuiteName: "Ware2Go - IL (Batavia)", address: "1206 NAGEL BLVD, Batavia, IL 60510" },
+    "W2G-KY": { netsuiteName: "Ware2Go - KY (Hebron)", address: "Hebron, KY" },
+    "W2G-TX": { netsuiteName: "Ware2Go - TX (Grapevine)", address: "2450 Esters Blvd #100, Grapevine, TX 76051" }
+};
 
 const router = Router();
 
@@ -325,6 +334,174 @@ router.get("/po-sync-debug", async (_req: any, res: any) => {
         });
     } catch (e: any) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// ─── Sync Single PO by PO Number ───────────────────────────────────────────
+// POST /sync-single-po
+// Body: { po_number: 12345 }
+// Finds the PO in suite_purchase_order (or po_management if not staged) and syncs just that one
+router.post("/sync-single-po", async (req: any, res: any) => {
+    try {
+        const poNumber = req.body?.po_number;
+
+        if (!poNumber) {
+            return res.status(400).json({ success: false, error: "po_number is required in body" });
+        }
+
+        const nsDb = await getDb("netsuite");
+        const poColl = nsDb.collection("suite_purchase_order");
+
+        // Find the PO by po_number in staged collection
+        let po = await poColl.findOne({ po_number: poNumber });
+
+        // ── If not staged, try to find in po_management and stage it ──
+        if (!po) {
+            log.info(`[SYNC-SINGLE-PO] PO ${poNumber} not in suite_purchase_order, checking po_management...`);
+
+            const poDb = await getDb("ebp_pomanager");
+            const sourcePo = await poDb.collection("po_management").findOne({ po_number: poNumber });
+
+            if (!sourcePo) {
+                return res.status(404).json({
+                    success: false,
+                    error: `PO ${poNumber} not found in suite_purchase_order or po_management`
+                });
+            }
+
+            log.info(`[SYNC-SINGLE-PO] Found PO ${poNumber} in po_management, auto-staging...`);
+
+            // Build staged PO document (same logic as po.stage.ts)
+            const vendor = resolveVendor(sourcePo.distributor, sourcePo.payment_type);
+            const validatedWarehouse = validateWarehouse(
+                sourcePo.stocking_warehouse,
+                sourcePo.po_type,
+                sourcePo.po_number
+            );
+
+            // Log warehouse and address
+            const whInfo = WAREHOUSE_MAP[validatedWarehouse];
+            if (whInfo) {
+                log.info(`[SYNC-SINGLE-PO] Warehouse: ${validatedWarehouse} → ${whInfo.netsuiteName} (${whInfo.address})`);
+            } else if (sourcePo.po_type === "Stocking") {
+                log.warn(`[SYNC-SINGLE-PO] Warehouse: ${validatedWarehouse} — NO ADDRESS FOUND!`);
+            }
+
+            const stagedPo = {
+                po_number: sourcePo.po_number,
+                website_order_number: sourcePo.website_order_number || "",
+                distributor: vendor.name,
+                distributor_order_number: sourcePo.distributor_order_number ?? null,
+                status: sourcePo.status || "",
+                invoice: Array.isArray(sourcePo.invoice) ? sourcePo.invoice : [],
+                vendor_id: vendor.id,
+                tracking: sourcePo.tracking ?? null,
+                order_items: sourcePo.order_items || [],
+                po_type: sourcePo.po_type || "",
+                stocking_warehouse: validatedWarehouse,
+                created_at: sourcePo.created_at || "",
+                updated_at: sourcePo.updated_at || "",
+                ns_synced: false
+            };
+
+            // Upsert to suite_purchase_order
+            await poColl.updateOne(
+                { po_number: poNumber },
+                { $set: stagedPo },
+                { upsert: true }
+            );
+
+            log.info(`[SYNC-SINGLE-PO] PO ${poNumber} staged successfully`);
+
+            // Re-fetch the staged PO (now it has _id)
+            po = await poColl.findOne({ po_number: poNumber });
+
+            if (!po) {
+                return res.status(500).json({
+                    success: false,
+                    error: `PO ${poNumber} staging failed — could not re-fetch after upsert`
+                });
+            }
+        }
+
+        log.info(`[SYNC-SINGLE-PO] Ready to sync PO ${poNumber}: type=${po.po_type || "unknown"}, warehouse=${po.stocking_warehouse || "none"}, website_order=${po.website_order_number || "none"}`);
+
+        // Reset sync flags so it will sync
+        await poColl.updateOne(
+            { _id: po._id },
+            {
+                $set: { ns_synced: false },
+                $unset: { ns_error: "", ns_error_at: "", ns_retry_count: "", ns_failed: "" }
+            }
+        );
+
+        // Call the sync with single PO payload directly to RESTlet
+        const poPayload: any = {
+            action: "update",
+            po_number: po.po_number,
+            otherrefnum: String(po.po_number),
+            vendor_id: po.vendor_id,
+            distributor: po.distributor,
+            distributor_order_number: po.distributor_order_number,
+            status: po.status,
+            invoice: po.invoice || [],
+            tracking: po.tracking,
+            order_items: po.order_items || [],
+            website_order_number: po.website_order_number || "",
+            po_type: po.po_type || "Stocking",
+            stocking_warehouse: po.stocking_warehouse || "",
+            created_at: po.created_at
+        };
+
+        log.info(`[SYNC-SINGLE-PO] Sending PO ${poNumber} to NetSuite...`);
+        const result = await postToNetsuiteForPO(poPayload);
+
+        // Update MongoDB with result
+        if (result.success === false) {
+            await poColl.updateOne(
+                { _id: po._id },
+                {
+                    $set: {
+                        ns_synced: false,
+                        ns_error: result.error || "sync_failed",
+                        ns_error_at: new Date()
+                    }
+                }
+            );
+            return res.status(500).json({
+                success: false,
+                error: result.error,
+                po_number: poNumber,
+                ns_result: result
+            });
+        }
+
+        await poColl.updateOne(
+            { _id: po._id },
+            {
+                $set: {
+                    ns_synced: true,
+                    ns_synced_at: new Date(),
+                    ns_result: result.action || "synced"
+                },
+                $unset: { ns_error: "", ns_error_at: "", ns_retry_count: "", ns_failed: "" }
+            }
+        );
+
+        log.info(`[SYNC-SINGLE-PO] PO ${poNumber} synced successfully: ${result.action}`);
+
+        res.json({
+            success: true,
+            po_number: poNumber,
+            staged: !po,  // was it auto-staged?
+            action: result.action,
+            internalId: result.internalId,
+            ns_result: result
+        });
+
+    } catch (e: any) {
+        log.error(`[SYNC-SINGLE-PO] Error syncing PO: ${e?.response?.data || e.message}`);
+        res.status(500).json({ success: false, error: e?.response?.data || e.message });
     }
 });
 
