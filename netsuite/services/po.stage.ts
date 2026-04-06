@@ -146,6 +146,13 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
             log.warn(`[PO Stage] PO ${po.po_number} has no po_type — will not trigger Dropship flow`);
         }
 
+        // Transform order_items: database uses 'quantity'/'amount', RESTlet expects 'qty'/'cost'
+        const transformedItems = (po.order_items || []).map((item: any) => ({
+            sku: item.sku,
+            qty: item.quantity || item.qty || 0,
+            cost: item.amount || item.cost || 0
+        }));
+
         staged.push({
             po_number:                po.po_number,
             website_order_number:     po.website_order_number     || "",
@@ -155,7 +162,7 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
             invoice:                  Array.isArray(po.invoice) ? po.invoice : [],
             vendor_id:                vendor.id,
             tracking:                 po.tracking ?? null,
-            order_items:              po.order_items || [],
+            order_items:              transformedItems,
             po_type:                  po.po_type                  || "",
             stocking_warehouse:       validatedWarehouse,
             created_at:               po.created_at  || "",
