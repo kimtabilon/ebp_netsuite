@@ -436,6 +436,13 @@ router.post("/sync-single-po", async (req: any, res: any) => {
         );
 
         // Call the sync with single PO payload directly to RESTlet
+        // Transform order_items: database uses 'quantity'/'amount', RESTlet expects 'qty'/'cost'
+        const transformedOrderItems = (po.order_items || []).map((item: any) => ({
+            sku: item.sku,
+            qty: item.quantity || item.qty || 0,
+            cost: item.amount || item.cost || 0
+        }));
+
         const poPayload: any = {
             action: "update",
             po_number: po.po_number,
@@ -446,7 +453,7 @@ router.post("/sync-single-po", async (req: any, res: any) => {
             status: po.status,
             invoice: po.invoice || [],
             tracking: po.tracking,
-            order_items: po.order_items || [],
+            order_items: transformedOrderItems,
             website_order_number: po.website_order_number || "",
             po_type: po.po_type || "Stocking",
             stocking_warehouse: po.stocking_warehouse || "",
