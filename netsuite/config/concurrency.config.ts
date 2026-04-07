@@ -13,16 +13,28 @@ import log from "./logger.config";
 
 const MAX_CONCURRENT = parseInt(process.env.NS_MAX_CONCURRENT || "4", 10);
 
-let active = 0;
-const queue: Array<() => void> = [];
+// Max time (ms) a worker will wait in the queue before giving up.
+// Prevents infinite blocking when all slots are held by hung connections.
+const ACQUIRE_TIMEOUT_MS = 60_000; // 60s
 
-function acquire(): Promise<void> {
+let active = 0;
+const queue: Array<{ resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }> = [];
+
+function acquire(label?: string): Promise<void> {
     if (active < MAX_CONCURRENT) {
         active++;
         return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-        queue.push(() => { active++; resolve(); });
+    return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            // Remove this entry from the queue so release() won't invoke it
+            const idx = queue.findIndex(e => e.resolve === wrappedResolve);
+            if (idx !== -1) queue.splice(idx, 1);
+            reject(new Error(`[Concurrency] Timed out waiting for slot after ${ACQUIRE_TIMEOUT_MS}ms — ${label || "unknown"}`));
+        }, ACQUIRE_TIMEOUT_MS);
+
+        const wrappedResolve = () => { clearTimeout(timer); active++; resolve(); };
+        queue.push({ resolve: wrappedResolve, reject, timer });
     });
 }
 
@@ -30,7 +42,7 @@ function release(): void {
     active--;
     if (queue.length > 0) {
         const next = queue.shift()!;
-        next();
+        next.resolve();
     }
 }
 
@@ -46,7 +58,7 @@ export async function withConcurrency<T>(fn: () => Promise<T>, label?: string): 
         log.warn(`[Concurrency] QUEUED — all ${MAX_CONCURRENT} slots busy, ${queue.length + 1} waiting — ${label || "unknown"}`);
     }
 
-    await acquire();
+    await acquire(label);
 
     if (wasQueued) {
         const waited = Date.now() - t0;
@@ -63,4 +75,16 @@ export async function withConcurrency<T>(fn: () => Promise<T>, label?: string): 
 /** Current usage stats — useful for diagnostics */
 export function getConcurrencyStats() {
     return { active, queued: queue.length, max: MAX_CONCURRENT };
+}
+
+/**
+ * Drain all queued waiters with an error — used during graceful shutdown
+ * to unblock any workers waiting for a concurrency slot.
+ */
+export function drainQueue(): void {
+    while (queue.length > 0) {
+        const entry = queue.shift()!;
+        clearTimeout(entry.timer);
+        entry.reject(new Error("[Concurrency] Server shutting down — slot acquisition cancelled"));
+    }
 }

@@ -711,11 +711,12 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
     };
 
     var CHANNEL_MAP = {
-        "amazon":  "3rd Party Marketplace : Amazon",
-        "walmart": "3rd Party Marketplace : Walmart",
-        "newegg":  "3rd Party Marketplace : NewEgg",
-        "ebay":    "3rd Party Marketplace : eBay",
-        "shopify": "3rd Party Marketplace : Shopify"
+        "amazon":          "3rd Party Marketplace : Amazon",
+        "walmart":         "3rd Party Marketplace : Walmart",
+        "newegg":          "3rd Party Marketplace : NewEgg",
+        "newegg_business": "3rd Party Marketplace : NewEgg",
+        "ebay":            "3rd Party Marketplace : eBay",
+        "shopify":         "3rd Party Marketplace : Shopify"
     };
 
     var FORM_NAME       = "Ecomm BP - Sales Order";
@@ -734,6 +735,10 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         var before = null;
 
         try {
+            if (!payload || typeof payload !== "object") {
+                return { success: false, error: "Invalid or missing payload" };
+            }
+
             log.debug("PAYLOAD", JSON.stringify(payload));
 
             // ── Extract payload fields ────────────────────────────────────────
@@ -870,12 +875,12 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         var fieldValues = {};
 
                         if (trandate) {
-                            var pd = new Date(trandate);
-                            if (!isNaN(pd.getTime())) fieldValues["trandate"] = pd;
+                            var pd = parseSafeDate(trandate);
+                            if (pd) fieldValues["trandate"] = pd;
                         }
                         if (ship_date) {
-                            var psd = new Date(ship_date);
-                            if (!isNaN(psd.getTime())) fieldValues["shipdate"] = psd;
+                            var psd = parseSafeDate(ship_date);
+                            if (psd) fieldValues["shipdate"] = psd;
                         }
                         if (order_status)        fieldValues["custbody1"] = String(order_status);
                         if (fulfillment_channel) fieldValues["custbody3"] = String(fulfillment_channel);
@@ -955,15 +960,20 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             // Standard header fields
             so.setValue({ fieldId: "otherrefnum", value: String(otherrefnum) });
 
+            // Date parsing: extract Y/M/D parts to build a local-midnight Date.
+            // new Date("2026-01-15T00:00:00Z") is midnight UTC which, in US/Pacific,
+            // becomes Jan 14 — causing an off-by-one-day error. By extracting the
+            // date components and constructing a local Date, we always get the
+            // intended calendar date regardless of the NetSuite company timezone.
             if (trandate) {
-                var parsedDate = new Date(trandate);
-                if (!isNaN(parsedDate.getTime())) {
+                var parsedDate = parseSafeDate(trandate);
+                if (parsedDate) {
                     so.setValue({ fieldId: "trandate", value: parsedDate });
                 }
             }
             if (ship_date) {
-                var parsedShipDate = new Date(ship_date);
-                if (!isNaN(parsedShipDate.getTime())) {
+                var parsedShipDate = parseSafeDate(ship_date);
+                if (parsedShipDate) {
                     so.setValue({ fieldId: "shipdate", value: parsedShipDate });
                 }
             }
@@ -1100,6 +1110,31 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
     // HELPERS
     // ═════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Parse a date string into a local-midnight Date object.
+     * Avoids UTC→timezone day shift by extracting Y/M/D components
+     * from the ISO string and constructing a local Date.
+     * Handles: "2026-01-15T00:00:00Z", "2026-01-15", "1/15/2026", Date objects
+     */
+    function parseSafeDate(raw) {
+        if (!raw) return null;
+        var d = new Date(raw);
+        if (isNaN(d.getTime())) return null;
+        // If the input looks like an ISO string, extract Y-M-D to avoid timezone shift
+        var str = String(raw);
+        var isoMatch = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (isoMatch) {
+            return new Date(parseInt(isoMatch[1], 10), parseInt(isoMatch[2], 10) - 1, parseInt(isoMatch[3], 10));
+        }
+        // For "M/D/YYYY" format (from server toSafeISO)
+        var mdyMatch = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        if (mdyMatch) {
+            return new Date(parseInt(mdyMatch[3], 10), parseInt(mdyMatch[1], 10) - 1, parseInt(mdyMatch[2], 10));
+        }
+        // Fallback: use the Date as-is (already parsed above)
+        return d;
+    }
+
     function findCustomer(companyName) {
         if (_customerCache[companyName]) return _customerCache[companyName];
 
@@ -1149,19 +1184,31 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             log.debug("CHANNEL_GETOPTIONS_ERR", e.message);
         }
 
-        // Attempt 2: brute-force record.load fallback
+        // Attempt 2: search custom record (efficient — single search vs 20 record.load calls)
         if (!recordId) {
-            for (var rid = 1; rid <= 20; rid++) {
-                try {
-                    var rec     = record.load({ type: "customrecord_csegecomm_channel", id: rid });
-                    var recName = rec.getValue({ fieldId: "name" });
-                    if (recName === name || recName === childPart ||
-                        (recName && recName.indexOf(childPart) >= 0)) {
-                        recordId = String(rid);
-                        log.debug("LEADSOURCE_MATCH", "'" + recName + "' → ID " + recordId);
+            try {
+                var crResults = search.create({
+                    type: "customrecord_csegecomm_channel",
+                    filters: [
+                        ["name", "contains", childPart]
+                    ],
+                    columns: [
+                        search.createColumn({ name: "internalid" }),
+                        search.createColumn({ name: "name" })
+                    ]
+                }).run().getRange({ start: 0, end: 10 });
+
+                for (var cri = 0; cri < crResults.length; cri++) {
+                    var crName = crResults[cri].getValue("name");
+                    if (crName === name || crName === childPart ||
+                        (crName && crName.indexOf(childPart) >= 0)) {
+                        recordId = String(crResults[cri].getValue("internalid"));
+                        log.debug("LEADSOURCE_MATCH", "'" + crName + "' → ID " + recordId);
                         break;
                     }
-                } catch (e) {}
+                }
+            } catch (searchErr) {
+                log.debug("LEADSOURCE_SEARCH_ERR", searchErr.message);
             }
         }
 

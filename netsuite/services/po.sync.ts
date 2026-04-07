@@ -15,6 +15,10 @@ const BATCH_SIZE = 10;           // POs per RESTlet call (batch mode)
 const STOCKING_BATCH = 200;      // raised — fewer HTTP calls now
 const DROPSHIP_BATCH = 200;      // raised — fewer HTTP calls now
 
+// Results we consider fully resolved and should never re-queue
+// (matches the pattern in sales_order.sync.ts)
+const RESOLVED_RESULTS = ["created", "updated", "no_items", "skipped_no_po_number"];
+
 // Parse created_at safely — sends "M/D/YYYY" to avoid UTC→timezone date shift.
 // NetSuite trandate only needs a date, not a time.
 function toSafeISO(raw: any): string {
@@ -32,10 +36,12 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
     const collection = ns_db.collection("suite_purchase_order");
     const soCollection = ns_db.collection("suite_sales_order");
 
-    // Base filter: skip permanently failed; in "skip" mode also skip already-synced
+    // Base filter: skip permanently failed and already-resolved POs.
+    // update mode: re-queue everything except resolved and permanently failed
+    // skip mode:   only pick up unsynced POs
     const baseFilter = SYNC_MODE === "update"
-        ? { ns_failed: { $ne: true } }
-        : { ns_synced: { $ne: true }, ns_failed: { $ne: true } };
+        ? { ns_failed: { $ne: true }, ns_result: { $nin: RESOLVED_RESULTS } }
+        : { ns_synced: { $ne: true }, ns_failed: { $ne: true }, ns_result: { $nin: RESOLVED_RESULTS } };
 
     // ── Phase 1: Stocking POs (no SO dependency) ────────────────────────
     const stockingOrders = await collection

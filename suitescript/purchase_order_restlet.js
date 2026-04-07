@@ -80,11 +80,11 @@ define(["N/record", "N/search", "N/log", "N/runtime" , "N/query"], function (rec
         },
         "W2G-KY": {
             addressee: "Ware2Go - KY (Hebron)",
-            addr1: "Hebron",
+            addr1: "2525 Litton Lane",
             addr2: "",
             city: "Hebron",
             state: "KY",
-            zip: "",
+            zip: "41048",
             country: "US"
         },
         "W2G-TX": {
@@ -437,7 +437,7 @@ define(["N/record", "N/search", "N/log", "N/runtime" , "N/query"], function (rec
         for (var ci = 0; ci < lineCount; ci++) {
             so.selectLine({ sublistId: "item", line: ci });
             try {
-                so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: " ", ignoreFieldChange: true });
+                so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: "", ignoreFieldChange: true });
                 so.setCurrentSublistValue({ sublistId: "item", fieldId: "povendor", value: "", ignoreFieldChange: true });
                 so.commitLine({ sublistId: "item" });
                 cleared++;
@@ -595,6 +595,9 @@ define(["N/record", "N/search", "N/log", "N/runtime" , "N/query"], function (rec
                 created_at: created_at
             };
 
+            // Resolve form ID once — used across all dropship sub-paths
+            var dsFormId = findFormId("Ecomm BP - Purchase Order");
+
             if (po_type === "Dropship" && linkedSoId) {
                 // ── DROPSHIP FLOW ────────────────────────────────────────────
                 autoPOInfo = findLinkedPO(linkedSoId);
@@ -604,6 +607,10 @@ define(["N/record", "N/search", "N/log", "N/runtime" , "N/query"], function (rec
                     log.debug("LINKED_PO_FOUND", "PO " + autoPOInfo.poNumber + " (ID " + autoPOInfo.id + ") already linked to SO " + linkedSoNumber);
                     po = record.load({ type: record.Type.PURCHASE_ORDER, id: autoPOInfo.id, isDynamic: true });
                     isUpdate = true;
+
+                    // Set form + vendor (was missing — auto-POs inherit defaults, need our form/vendor)
+                    if (dsFormId) po.setValue({ fieldId: "customform", value: parseInt(dsFormId, 10) });
+                    if (vendor_id) po.setValue({ fieldId: "entity", value: parseInt(vendor_id, 10) });
 
                     // Set headers + snapshot
                     setPOHeaders(po, headerOpts);
@@ -696,13 +703,16 @@ define(["N/record", "N/search", "N/log", "N/runtime" , "N/query"], function (rec
                         } else {
                             // Auto-PO NOT created — use record.transform (SO → PO) to ensure createdfrom is set.
                             log.debug("AUTO_PO_MISSING", "No auto-PO found — creating PO via record.transform from SO " + linkedSoId);
+                            var safeVendorId = vendor_id ? parseInt(vendor_id, 10) : null;
                             try {
+                                var transformDefaults = {};
+                                if (safeVendorId && !isNaN(safeVendorId)) transformDefaults.entity = safeVendorId;
                                 po = record.transform({
                                     fromType: record.Type.SALES_ORDER,
                                     fromId: parseInt(linkedSoId, 10),
                                     toType: record.Type.PURCHASE_ORDER,
                                     isDynamic: true,
-                                    defaultValues: { entity: parseInt(vendor_id, 10) }
+                                    defaultValues: transformDefaults
                                 });
                                 // Force explicit link just in case
                                 try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) { }
@@ -745,13 +755,16 @@ define(["N/record", "N/search", "N/log", "N/runtime" , "N/query"], function (rec
                         // record.transform guarantees createdfrom is set correctly IF lines map over.
                         // If they don't, we still get a PO but we need to try forcing the link.
                         var transformErrObj = null;
+                        var safeVendorId2 = vendor_id ? parseInt(vendor_id, 10) : null;
                         try {
+                            var transformDefaults2 = {};
+                            if (safeVendorId2 && !isNaN(safeVendorId2)) transformDefaults2.entity = safeVendorId2;
                             po = record.transform({
                                 fromType: record.Type.SALES_ORDER,
                                 fromId: parseInt(linkedSoId, 10),
                                 toType: record.Type.PURCHASE_ORDER,
                                 isDynamic: true,
-                                defaultValues: { entity: parseInt(vendor_id, 10) }
+                                defaultValues: transformDefaults2
                             });
                             // Force explicit link just in case
                             try { po.setValue({ fieldId: "createdfrom", value: parseInt(linkedSoId, 10) }); } catch (e) { }

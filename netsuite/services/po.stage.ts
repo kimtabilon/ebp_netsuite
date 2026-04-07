@@ -4,12 +4,14 @@ import log from "../config/logger.config";
 // ── Warehouse map: stocking_warehouse code → NetSuite location name ──
 // These must match the WAREHOUSE_MAP in purchase_order_restlet.js
 // All 5 warehouses: MW (California), W2G-PA (PA), W2G-IL (IL), W2G-KY (KY), W2G-TX (TX)
+// netsuiteName must match the NetSuite location record name exactly
+// (these are the names used by the RESTlet's WAREHOUSE_MAP → findLocationByName)
 const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
     "MW":     { netsuiteName: "California - Chatsworth", address: "21540 Prairie Street, Suite F, Chatsworth CA 91311" },
     "W2G-PA": { netsuiteName: "Ware2Go - PA (Fairless Hills)", address: "1 Kresge Road, Fairless Hills, PA 19030" },
-    "W2G-IL": { netsuiteName: "Ware2Go - IL (Batavia)", address: "1206 NAGEL BLVD, Batavia, IL 60510" },
-    "W2G-KY": { netsuiteName: "Ware2Go - KY (Hebron)", address: "Hebron, KY" },
-    "W2G-TX": { netsuiteName: "Ware2Go - TX (Grapevine)", address: "2450 Esters Blvd #100, Grapevine, TX 76051" }
+    "W2G-IL": { netsuiteName: "Ware2Go - IL (Aurora)", address: "1206 NAGEL BLVD, Batavia, IL 60510" },
+    "W2G-KY": { netsuiteName: "Ware2Go - KY (Hebron)", address: "2525 Litton Lane, Hebron, KY 41048" },
+    "W2G-TX": { netsuiteName: "Ware2Go - TX (Dallas)", address: "2450 Esters Blvd #100, Grapevine, TX 76051" }
 };
 
 // Valid warehouse codes for quick lookup

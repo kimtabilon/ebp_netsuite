@@ -4,14 +4,15 @@ import { getDb } from "../config/mongdodb.config";
 import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "../services/po.sync";
 import { stagePurchaseOrders, resolveVendor, validateWarehouse } from "../services/po.stage";
 import { postToNetsuiteForPO } from "../services/netsuite.client";
+import { listPurchaseOrders, getPurchaseOrder, fetchAllPurchaseOrders } from "../services/netsuite.rest.client";
 
 // ── Warehouse map with addresses for logging ───────────────────────────────
 const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
     "MW":     { netsuiteName: "California - Chatsworth", address: "21540 Prairie Street, Suite F, Chatsworth CA 91311" },
     "W2G-PA": { netsuiteName: "Ware2Go - PA (Fairless Hills)", address: "1 Kresge Road, Fairless Hills, PA 19030" },
-    "W2G-IL": { netsuiteName: "Ware2Go - IL (Batavia)", address: "1206 NAGEL BLVD, Batavia, IL 60510" },
-    "W2G-KY": { netsuiteName: "Ware2Go - KY (Hebron)", address: "Hebron, KY" },
-    "W2G-TX": { netsuiteName: "Ware2Go - TX (Grapevine)", address: "2450 Esters Blvd #100, Grapevine, TX 76051" }
+    "W2G-IL": { netsuiteName: "Ware2Go - IL (Aurora)", address: "1206 NAGEL BLVD, Batavia, IL 60510" },
+    "W2G-KY": { netsuiteName: "Ware2Go - KY (Hebron)", address: "2525 Litton Lane, Hebron, KY 41048" },
+    "W2G-TX": { netsuiteName: "Ware2Go - TX (Dallas)", address: "2450 Esters Blvd #100, Grapevine, TX 76051" }
 };
 
 const router = Router();
@@ -555,6 +556,92 @@ router.post("/delete-all-po", async (_req: any, res: any) => {
     } catch (e: any) {
         log.error("[DELETE-PO] ERROR", { status: e?.response?.status, data: e?.response?.data, message: e.message });
         res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// NETSUITE REST API - PURCHASE ORDERS
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /purchaseOrder
+ * List Purchase Orders from NetSuite via REST API
+ * 
+ * Headers:
+ *   Prefer: respond-async
+ *   X-NetSuite-Idempotency-Key: string
+ * 
+ * Query:
+ *   q: SuiteQL query string
+ *   limit: number (default 1000)
+ *   offset: number (default 0)
+ *   expandItems: boolean
+ *   fetchAll: boolean - If true, fetches ALL pages and gets full record details for each
+ */
+router.get("/purchaseOrder", async (req: any, res: any) => {
+    const prefer = req.headers.prefer;
+    const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
+    const fetchAll = req.query.fetchAll === "true";
+
+    try {
+        // fetchAll mode: get all pages and full record details
+        if (fetchAll) {
+            log.info("[PurchaseOrder List] fetchAll mode enabled - fetching all pages and details");
+            const allRecords = await fetchAllPurchaseOrders({
+                q: req.query.q,
+                expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
+                maxRecords: req.query.maxRecords ? parseInt(req.query.maxRecords, 10) : undefined
+            });
+            return res.json({
+                success: true,
+                fetchAll: true,
+                count: allRecords.length,
+                items: allRecords
+            });
+        }
+
+        const options = {
+            q: req.query.q,
+            limit: req.query.limit ? parseInt(req.query.limit, 10) : 1000,
+            offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
+            expandSubResources: req.query.expandItems === "true" ? "item" : undefined
+        };
+
+        if (prefer === "respond-async") {
+            if (!idempotencyKey) {
+                return res.status(400).json({ success: false, error: "X-NetSuite-Idempotency-Key required for async" });
+            }
+            const data = await listPurchaseOrders(options);
+            return res.status(202).setHeader("Preference-Applied", "respond-async").json({
+                success: true,
+                async: true,
+                idempotencyKey,
+                ...data
+            });
+        }
+
+        const data = await listPurchaseOrders(options);
+        return res.json({ success: true, ...data });
+    } catch (e: any) {
+        log.error("[PurchaseOrder List] Error:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * GET /purchaseOrder/:id
+ * Get single Purchase Order by ID
+ */
+router.get("/purchaseOrder/:id", async (req: any, res: any) => {
+    const { id } = req.params;
+    const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
+
+    try {
+        const data = await getPurchaseOrder(id, expandSubResources);
+        res.json({ success: true, data });
+    } catch (e: any) {
+        log.error(`[PurchaseOrder Get] ${id} Error:`, e.message);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 

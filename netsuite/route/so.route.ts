@@ -5,6 +5,7 @@ import { stageSalesOrders } from "../services/sales_order.stage";
 import { syncSalesOrdersToNetsuite, retryFailedSalesOrders } from "../services/sales_order.sync";
 import { migrateSalesOrderSchema, migrateMultiVendorSchema } from "../services/sales_order.migrate";
 import { postToNetsuite } from "../services/netsuite.client";
+import { listSalesOrders, getSalesOrder, fetchAllSalesOrders } from "../services/netsuite.rest.client";
 
 const router = Router();
 
@@ -357,6 +358,92 @@ router.post("/restage-walmart", async (_req: any, res: any) => {
         res.json({ success: true, action: "deleted_for_restage", deleted: result.deletedCount });
     } catch (e: any) {
         log.error("[RESTAGE-WALMART] Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// NETSUITE REST API - SALES ORDERS
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /salesOrder
+ * List Sales Orders from NetSuite via REST API
+ * 
+ * Headers:
+ *   Prefer: respond-async
+ *   X-NetSuite-Idempotency-Key: string
+ * 
+ * Query:
+ *   q: SuiteQL query string
+ *   limit: number (default 1000)
+ *   offset: number (default 0)
+ *   expandItems: boolean
+ *   fetchAll: boolean - If true, fetches ALL pages and gets full record details for each
+ */
+router.get("/salesOrder", async (req: any, res: any) => {
+    const prefer = req.headers.prefer;
+    const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
+    const fetchAll = req.query.fetchAll === "true";
+
+    try {
+        // fetchAll mode: get all pages and full record details
+        if (fetchAll) {
+            log.info("[SalesOrder List] fetchAll mode enabled - fetching all pages and details");
+            const allRecords = await fetchAllSalesOrders({
+                q: req.query.q,
+                expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
+                maxRecords: req.query.maxRecords ? parseInt(req.query.maxRecords, 10) : undefined
+            });
+            return res.json({
+                success: true,
+                fetchAll: true,
+                count: allRecords.length,
+                items: allRecords
+            });
+        }
+
+        const options = {
+            q: req.query.q,
+            limit: req.query.limit ? parseInt(req.query.limit, 10) : 1000,
+            offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
+            expandSubResources: req.query.expandItems === "true" ? "item" : undefined
+        };
+
+        if (prefer === "respond-async") {
+            if (!idempotencyKey) {
+                return res.status(400).json({ success: false, error: "X-NetSuite-Idempotency-Key required for async" });
+            }
+            const data = await listSalesOrders(options);
+            return res.status(202).setHeader("Preference-Applied", "respond-async").json({
+                success: true,
+                async: true,
+                idempotencyKey,
+                ...data
+            });
+        }
+
+        const data = await listSalesOrders(options);
+        return res.json({ success: true, ...data });
+    } catch (e: any) {
+        log.error("[SalesOrder List] Error:", e.message);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * GET /salesOrder/:id
+ * Get single Sales Order by ID
+ */
+router.get("/salesOrder/:id", async (req: any, res: any) => {
+    const { id } = req.params;
+    const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
+
+    try {
+        const data = await getSalesOrder(id, expandSubResources);
+        res.json({ success: true, data });
+    } catch (e: any) {
+        log.error(`[SalesOrder Get] ${id} Error:`, e.message);
         res.status(500).json({ success: false, error: e.message });
     }
 });

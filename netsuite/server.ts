@@ -5,10 +5,11 @@ import log from "./config/logger.config";
 import { getDb } from "./config/mongdodb.config";
 import { retryFailedSalesOrders, syncSalesOrdersToNetsuite } from "./services/sales_order.sync";
 import { stagePurchaseOrders } from "./services/po.stage";
-import { syncPurchaseOrdersToNetsuite } from "./services/po.sync";
+import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "./services/po.sync";
 import { stageBills } from "./services/bill.stage";
 import { syncBillsToNetsuite, retryFailedBills } from "./services/bill.sync";
 import { runItemFullSync } from "./controller/netsuite_item_full";
+import { drainQueue } from "./config/concurrency.config";
 
 // Route modules
 import soRoutes from "./route/so.route";
@@ -38,7 +39,7 @@ app.use("/api/v4", indexRoutes);
 // SERVER
 // ═══════════════════════════════════════════════════════════════════════════════
 const PORT = 5002;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     log.info(`Server running at http://localhost:${PORT}`);
     log.info(`──── Sales Orders ────`);
     log.info(`  Stage SO:        GET  /stage-so`);
@@ -66,27 +67,83 @@ app.listen(PORT, () => {
     log.info(`  Bill Ready:      GET  /bill-ready`);
     log.info(`  Direct Bill:     POST /bill-test`);
     log.info(`──── Cron Schedule ────`);
-    log.info(`  SO:   every 90 min  (0:00, 1:30, 3:00, 4:30 ...)`);
+    log.info(`  SO:   every 20 min  (:00, :20, :40)`);
     log.info(`  PO:   every 20 min  (:07, :27, :47)`);
-    log.info(`  Bill: every 20 min  (:14, :34, :54)`);
+    log.info(`  Bill: every 20 min  (:14, :34, :54) [DISABLED]`);
     log.info(`  SO retry:   daily 3:00 AM`);
-    log.info(`  Bill retry: daily 3:30 AM`);
+    log.info(`  PO retry:   daily 3:15 AM`);
+    log.info(`  Bill retry: daily 3:30 AM [DISABLED]`);
     log.info(`──── Items & Diagnostics ────`);
     log.info(`  Items:           GET  /netsuite-items`);
     log.info(`  Items Full:      GET  /netsuite-items-full`);
     log.info(`  POs:             GET  /netsuite-po`);
     log.info(`  Diagnostic:      GET|POST /diagnostic`);
     log.info(`  Cleanup:         GET|POST /cleanup`);
+
+    // Ensure indexes after server boots (non-blocking)
+    ensureIndexes().catch(err => log.error("[STARTUP] Index creation failed", { error: err.message }));
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MONGODB INDEXES — created once on startup, idempotent
+// ═══════════════════════════════════════════════════════════════════════════════
+async function ensureIndexes() {
+    const nsDb = await getDb("netsuite");
+
+    // suite_sales_order indexes
+    const soCol = nsDb.collection("suite_sales_order");
+    await soCol.createIndex(
+        { otherrefnum: 1, order_source: 1 },
+        { unique: true, name: "idx_so_otherrefnum_source", background: true }
+    );
+    await soCol.createIndex(
+        { ns_synced: 1, ns_failed: 1, ns_result: 1 },
+        { name: "idx_so_sync_status", background: true }
+    );
+
+    // suite_purchase_order indexes
+    const poCol = nsDb.collection("suite_purchase_order");
+    await poCol.createIndex(
+        { po_number: 1 },
+        { unique: true, name: "idx_po_number", background: true }
+    );
+    await poCol.createIndex(
+        { ns_synced: 1, ns_failed: 1, ns_result: 1 },
+        { name: "idx_po_sync_status", background: true }
+    );
+    await poCol.createIndex(
+        { po_type: 1, ns_synced: 1, ns_failed: 1, website_order_number: 1 },
+        { name: "idx_po_dropship_lookup", background: true }
+    );
+
+    log.info("[STARTUP] MongoDB indexes ensured for suite_sales_order and suite_purchase_order");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRON SAFETY — wraps a sync function with a hard timeout so a hung call
+// can never block the guard flag forever.
+// ═══════════════════════════════════════════════════════════════════════════════
+const CRON_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes — generous but finite
+
+function withTimeout<T>(fn: () => Promise<T>, label: string, ms = CRON_TIMEOUT_MS): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(`[CRON] ${label} timed out after ${ms / 1000}s`));
+        }, ms);
+
+        fn().then(
+            (val) => { clearTimeout(timer); resolve(val); },
+            (err) => { clearTimeout(timer); reject(err); }
+        );
+    });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CRON JOBS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ─── Every 90 min — Sales Orders (staging + sync) ─────────────────────────
-// 90 min = two cron entries sharing one guard.
-// Runs at: 0:00, 1:30, 3:00, 4:30, 6:00, 7:30, 9:00, 10:30,
-//          12:00, 13:30, 15:00, 16:30, 18:00, 19:30, 21:00, 22:30
+// ─── Every 20 min — Sales Orders (staging + sync) ─────────────────────────
+// SO at :00, :20, :40 — runs before PO (PO at :07, :27, :47)
 let soSyncRunning = false;
 
 async function runSOSync() {
@@ -97,10 +154,10 @@ async function runSOSync() {
     soSyncRunning = true;
     try {
         log.info("[CRON] [SO] Step 1 — Staging sales orders...");
-        await stageSalesOrders();
+        await withTimeout(() => stageSalesOrders(), "SO-Stage");
 
         log.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-        await syncSalesOrdersToNetsuite();
+        await withTimeout(() => syncSalesOrdersToNetsuite(), "SO-Sync");
     } catch (err: any) {
         log.error("[CRON] [SO] Error", { error: err.message });
     } finally {
@@ -108,8 +165,7 @@ async function runSOSync() {
     }
 }
 
-cron.schedule("0 0,3,6,9,12,15,18,21 * * *", runSOSync);   // even hours :00
-cron.schedule("30 1,4,7,10,13,16,19,22 * * *", runSOSync);  // odd hours :30
+cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
 
 // ─── Every 20 min — Purchase Orders (staging + sync) ──────────────────────
 // PO at :07, :27, :47 — 7-min offset from SO to avoid API overlap.
@@ -125,10 +181,10 @@ cron.schedule("7,27,47 * * * *", async () => {
     poSyncRunning = true;
     try {
         log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
-        await stagePurchaseOrders();
+        await withTimeout(() => stagePurchaseOrders(), "PO-Stage");
 
         log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-        await syncPurchaseOrdersToNetsuite();
+        await withTimeout(() => syncPurchaseOrdersToNetsuite(), "PO-Sync");
     } catch (err: any) {
         log.error("[CRON] [PO] Error", { error: err.message });
     } finally {
@@ -171,6 +227,17 @@ cron.schedule("0 3 * * *", async () => {
     }
 });
 
+// ─── Daily 3:15 AM — Auto-retry permanently failed POs ──────────────────────
+cron.schedule("15 3 * * *", async () => {
+    log.info("[CRON] [PO-RETRY] Resetting permanently failed POs for retry...");
+    try {
+        const result = await retryFailedPurchaseOrders(true);
+        log.info(`[CRON] [PO-RETRY] Reset ${result.count} failed POs for retry`);
+    } catch (err: any) {
+        log.error("[CRON] [PO-RETRY] Error", { error: err.message });
+    }
+});
+
 // ─── Daily 3:30 AM — Auto-retry permanently failed Bills ────────────────
 // cron.schedule("30 3 * * *", async () => {
 //     log.info("[CRON] [BILL-RETRY] Resetting permanently failed bills for retry...");
@@ -204,6 +271,45 @@ let itemSyncRunning = false;
 //         itemSyncRunning = false;
 //     }
 // });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GRACEFUL SHUTDOWN
+// ═══════════════════════════════════════════════════════════════════════════════
+let shuttingDown = false;
+
+async function gracefulShutdown(signal: string) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info(`[SHUTDOWN] Received ${signal} — shutting down gracefully...`);
+
+    // 1. Stop accepting new HTTP connections
+    server.close(() => log.info("[SHUTDOWN] HTTP server closed"));
+
+    // 2. Drain any workers waiting for concurrency slots
+    drainQueue();
+
+    // 3. Wait for in-flight sync jobs to finish (up to 30s)
+    const deadline = Date.now() + 30_000;
+    while ((soSyncRunning || poSyncRunning) && Date.now() < deadline) {
+        log.info(`[SHUTDOWN] Waiting for in-flight syncs... SO=${soSyncRunning}, PO=${poSyncRunning}`);
+        await new Promise(r => setTimeout(r, 2_000));
+    }
+
+    if (soSyncRunning || poSyncRunning) {
+        log.warn("[SHUTDOWN] Timed out waiting for syncs — forcing exit");
+    }
+
+    log.info("[SHUTDOWN] Done. Bye.");
+    process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Catch unhandled rejections so they don't silently kill the process
+process.on("unhandledRejection", (reason: any) => {
+    log.error("[PROCESS] Unhandled rejection", { error: reason?.message || String(reason) });
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STARTUP

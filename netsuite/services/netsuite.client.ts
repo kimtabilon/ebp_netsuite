@@ -35,6 +35,8 @@ const buildOAuthHeader = (url: string, method: string): string => {
     return oauth.toHeader(authData).Authorization;
 };
 
+const RESTLET_TIMEOUT_MS = 30_000; // 30s — prevents hung calls from blocking concurrency slots forever
+
 const post = async (scriptId: string, deployId: string, payload: object): Promise<any> => {
     const url = buildRestletUrl(scriptId, deployId);
     log.info(`[NS Client] POST → ${url}`);
@@ -46,7 +48,8 @@ const post = async (scriptId: string, deployId: string, payload: object): Promis
             headers: {
                 Authorization: authHeader,
                 "Content-Type": "application/json"
-            }
+            },
+            timeout: RESTLET_TIMEOUT_MS,
         });
         log.debug("[NS Client] Response", { action: response.data?.action, success: response.data?.success, itemCount: response.data?.fetch_items_fast?.count });
         return response.data;
@@ -131,7 +134,8 @@ export const testNetsuiteAuth = async (): Promise<void> => {
             headers: {
                 Authorization: authHeader,
                 "Content-Type": "application/json"
-            }
+            },
+            timeout: RESTLET_TIMEOUT_MS,
         });
         log.info("[AUTH] SUCCESS — NetSuite responded", { data: response.data });
     } catch (err: any) {
