@@ -172,15 +172,15 @@ cron.schedule("0 3 * * *", async () => {
 });
 
 // ─── Daily 3:30 AM — Auto-retry permanently failed Bills ────────────────
-cron.schedule("30 3 * * *", async () => {
-    log.info("[CRON] [BILL-RETRY] Resetting permanently failed bills for retry...");
-    try {
-        const result = await retryFailedBills(true);
-        log.info(`[CRON] [BILL-RETRY] Reset ${result.count} failed bills for retry`);
-    } catch (err: any) {
-        log.error("[CRON] [BILL-RETRY] Error", { error: err.message });
-    }
-});
+// cron.schedule("30 3 * * *", async () => {
+//     log.info("[CRON] [BILL-RETRY] Resetting permanently failed bills for retry...");
+//     try {
+//         const result = await retryFailedBills(true);
+//         log.info(`[CRON] [BILL-RETRY] Reset ${result.count} failed bills for retry`);
+//     } catch (err: any) {
+//         log.error("[CRON] [BILL-RETRY] Error", { error: err.message });
+//     }
+// });
 
 // ─── Every 30 mins — Item Sync (Phase 1 + Phase 2 chained) ──────────────────
 // Phase 1: SuiteQL bulk fetch (5 parallel workers, 5000/page → ~12-16s for 96k)
