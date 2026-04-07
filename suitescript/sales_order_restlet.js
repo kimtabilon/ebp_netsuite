@@ -722,10 +722,16 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
     var FORM_NAME       = "Ecomm BP - Sales Order";
     var SKIP_ITEM_TYPES = ["Group"];
 
+    // Default location name for SO lines — SuiteTax requires a location
+    // on every line to determine tax nexus. This should match an active
+    // Location record in your NetSuite account (e.g. your main warehouse).
+    var DEFAULT_SO_LOCATION_NAME = "California - Chatsworth";
+
     // ── Per-invocation caches ─────────────────────────────────────────────────
-    var _customerCache = {};
-    var _channelCache  = {};
-    var _formCache     = {};
+    var _customerCache  = {};
+    var _channelCache   = {};
+    var _formCache      = {};
+    var _locationCache  = {};
 
     // ═════════════════════════════════════════════════════════════════════════
     // MAIN POST HANDLER
@@ -813,7 +819,9 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                             columns: [
                                 search.createColumn({ name: "internalid" }),
                                 search.createColumn({ name: "type" }),
-                                search.createColumn({ name: "isinactive" })
+                                search.createColumn({ name: "isinactive" }),
+                                search.createColumn({ name: "islotitem" }),
+                                search.createColumn({ name: "isserialitem" })
                             ]
                         }).run().getRange({ start: 0, end: 5 });
 
@@ -841,15 +849,23 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                         var amt  = parseFloat(lineItem.amount)     || 0;
                         var rate = qty > 0 ? (amt / qty) : amt;
 
+                        // Detect lot/serial items — location must be SKIPPED for these
+                        // because setting location on a lot/serial item demands
+                        // inventory detail (bin/lot/serial) which is only known at fulfillment.
+                        var isLot    = itemResults[0].getValue("islotitem");
+                        var isSerial = itemResults[0].getValue("isserialitem");
+                        var needsInvDetail = (isLot === true || isLot === "T" || isSerial === true || isSerial === "T");
+
                         mappedItems.push({
-                            sku:        sku,
-                            internalId: itemInternalId,
-                            qty:        qty,
-                            amt:        amt,
-                            rate:       rate
+                            sku:            sku,
+                            internalId:     itemInternalId,
+                            qty:            qty,
+                            amt:            amt,
+                            rate:           rate,
+                            needsInvDetail: needsInvDetail
                         });
 
-                        log.debug("ITEM_MAPPED", "SKU \"" + sku + "\" → NS ID " + itemInternalId);
+                        log.debug("ITEM_MAPPED", "SKU \"" + sku + "\" → NS ID " + itemInternalId + (needsInvDetail ? " (lot/serial — no location)" : ""));
 
                     } catch (itemErr) {
                         log.error("ITEM_LOOKUP_ERR", "SKU \"" + sku + "\" — " + itemErr.message);
@@ -1000,40 +1016,90 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
                 }
             }
 
-            // Track old line count — must add new lines BEFORE removing old ones
-            // because NetSuite requires at least one valid line at all times.
+            // ── Resolve default location for SuiteTax ──────────────────────
+            // SuiteTax requires a location on every SO line to determine tax nexus.
+            // Without it, lines are considered "invalid" → VALID_LINE_ITEM_REQD.
+            var defaultLocationId = findLocationByName(DEFAULT_SO_LOCATION_NAME);
+            if (defaultLocationId) {
+                log.debug("DEFAULT_LOCATION", DEFAULT_SO_LOCATION_NAME + " → ID " + defaultLocationId);
+            } else {
+                log.audit("DEFAULT_LOCATION_MISSING", "Could not find location '" + DEFAULT_SO_LOCATION_NAME + "' — SuiteTax may reject lines without a location");
+            }
+
+            // ── Line item strategy ──────────────────────────────────────────
+            //
+            // SuiteTax (Advanced Tax) bug: if we add lines THEN remove old lines,
+            // the tax engine's internal line-index references become stale and
+            // so.save() throws VALID_LINE_ITEM_REQD even though lines exist.
+            //
+            // Fix: remove ALL old lines FIRST (clear the slate), then add new
+            // lines. NetSuite allows zero lines momentarily during scripted
+            // edits — validation only fires on save(). This gives SuiteTax a
+            // clean line-index mapping with no stale references.
+            //
             var oldLineCount = so.getLineCount({ sublistId: "item" });
             log.debug("PRE_LINES", "Existing lines: " + oldLineCount + " | New lines to add: " + mappedItems.length);
 
-            // ── Add new line items ────────────────────────────────────────────
+            // ── Step 1: Remove ALL existing lines (reverse order) ─────────────
+            if (oldLineCount > 0) {
+                log.debug("REMOVING_OLD_LINES", "Clearing " + oldLineCount + " existing lines before adding new ones");
+                for (var r = oldLineCount - 1; r >= 0; r--) {
+                    so.removeLine({ sublistId: "item", line: r });
+                }
+                log.debug("OLD_LINES_REMOVED", "Cleared — now has " + so.getLineCount({ sublistId: "item" }) + " lines");
+            }
+
+            // ── Step 2: Add new line items to the clean record ────────────────
+            //
+            // SuiteTax requires every line to have a valid tax-code for nexus.
+            // In dynamic mode, setting the "item" field auto-sources the tax code
+            // from the item record — BUT only if we let the field change propagate
+            // (ignoreFieldChange: false, which is the default for setCurrentSublistValue).
+            //
+            // Order matters:
+            //   1. item        — triggers auto-sourcing of taxcode, description, etc.
+            //   2. quantity    — must come after item so unit-based sourcing works
+            //   3. price = -1  — switches to "Custom" so we can set rate manually
+            //   4. rate        — our per-unit price (amount / quantity)
+            //   5. amount      — total = qty * rate (set explicitly for rounding safety)
+            //
             for (var mi = 0; mi < mappedItems.length; mi++) {
                 var mapped = mappedItems[mi];
                 try {
                     so.selectNewLine({ sublistId: "item" });
+                    // Item FIRST — sources taxcode, units, description from item record
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "item",     value: mapped.internalId });
+                    // Location SECOND — SuiteTax uses this for tax nexus determination.
+                    // SKIP for lot/serial items: setting location on these demands
+                    // inventory detail (bin/lot/serial #) which is only known at
+                    // fulfillment. SuiteTax will use the shipping address for nexus instead.
+                    if (defaultLocationId && !mapped.needsInvDetail) {
+                        so.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: defaultLocationId });
+                    }
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: mapped.qty });
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "price",    value: -1 }); // custom price
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "rate",     value: mapped.rate });
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "amount",   value: mapped.amt });
+
+                    // Verify SuiteTax auto-sourced a taxcode — if missing, the line is "invalid"
+                    var autoTaxCode = "";
+                    try { autoTaxCode = so.getCurrentSublistValue({ sublistId: "item", fieldId: "taxcode" }); } catch (tc) {}
+                    if (!autoTaxCode) {
+                        log.audit("TAXCODE_MISSING", "SKU " + mapped.sku + " (line " + mi + ") has no auto-sourced taxcode — SuiteTax may reject this line");
+                    }
+
                     so.commitLine({ sublistId: "item" });
-                    log.debug("LINE_ADDED_" + mi, "SKU " + mapped.sku + " → NS ID " + mapped.internalId);
+                    log.debug("LINE_ADDED_" + mi, "SKU " + mapped.sku + " → NS ID " + mapped.internalId +
+                        " taxcode=" + (autoTaxCode || "none") +
+                        (mapped.needsInvDetail ? " loc=SKIPPED(lot/serial)" : " loc=" + (defaultLocationId || "none")));
                 } catch (lineErr) {
                     log.error("LINE_ADD_ERR_" + mi, "SKU \"" + mapped.sku + "\" — " + lineErr.message);
                     skippedSkus.push(mapped.sku + " (line_error)");
                 }
             }
 
-            var linesAdded = so.getLineCount({ sublistId: "item" }) - oldLineCount;
-            log.debug("LINES_ADDED", linesAdded + " new lines added");
-
-            // ── Remove old lines (only if we successfully added new ones) ─────
-            if (linesAdded > 0 && oldLineCount > 0) {
-                log.debug("REMOVING_OLD_LINES", "Removing " + oldLineCount + " old lines");
-                for (var r = oldLineCount - 1; r >= 0; r--) {
-                    so.removeLine({ sublistId: "item", line: r });
-                }
-                log.debug("OLD_LINES_REMOVED", "Now has " + so.getLineCount({ sublistId: "item" }) + " lines");
-            }
+            var linesAdded = so.getLineCount({ sublistId: "item" });
+            log.debug("LINES_ADDED", linesAdded + " lines on record after rebuild");
 
             // ── Snapshot AFTER changes, BEFORE save ───────────────────────────
             var after = snapshotSO(so);
@@ -1041,11 +1107,28 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var diff = diffSnapshots(before, after);
             log.debug("SNAPSHOT_DIFF", JSON.stringify(diff));
 
+            // ── Safety: abort if zero lines after rebuild ────────────────────
+            // This can happen if all line adds threw errors. Don't save an empty SO.
+            var finalLineCount = so.getLineCount({ sublistId: "item" });
+            if (finalLineCount === 0) {
+                log.error("ZERO_LINES", otherrefnum + " — all line adds failed, aborting save");
+                return {
+                    success:     false,
+                    error:       "All line items failed to add — record not saved to prevent empty SO",
+                    otherrefnum: otherrefnum,
+                    skippedSkus: skippedSkus,
+                    before:      before
+                };
+            }
+
             // ── ONE save only ─────────────────────────────────────────────────
-            log.audit("SAVING", otherrefnum + " — saving with " + so.getLineCount({ sublistId: "item" }) + " lines");
+            // ignoreMandatoryFields: true — SuiteTax internally manages tax-related
+            // mandatory fields (taxcode, nexus) that scripting cannot always populate.
+            // enableSourcing: true — allows field-change cascades (currency, tax, etc.)
+            log.audit("SAVING", otherrefnum + " — saving with " + finalLineCount + " lines");
             var savedId;
             try {
-                savedId = so.save({ enableSourcing: true, ignoreMandatoryFields: false });
+                savedId = so.save({ enableSourcing: true, ignoreMandatoryFields: true });
             } catch (saveErr) {
                 log.error("SAVE_FAILED", JSON.stringify({
                     name:        saveErr.name,
@@ -1133,6 +1216,30 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         }
         // Fallback: use the Date as-is (already parsed above)
         return d;
+    }
+
+    function findLocationByName(locationName) {
+        if (_locationCache[locationName]) return _locationCache[locationName];
+
+        var idCol = search.createColumn({ name: "internalid" });
+        var results = search.create({
+            type: "location",
+            filters: [
+                ["name", "is", locationName],
+                "AND",
+                ["isinactive", "is", "F"]
+            ],
+            columns: [idCol]
+        }).run().getRange({ start: 0, end: 1 });
+
+        if (results.length === 0) {
+            log.debug("LOCATION_NOT_FOUND", "No active location named: " + locationName);
+            return null;
+        }
+
+        var locId = parseInt(results[0].getValue(idCol), 10);
+        _locationCache[locationName] = locId;
+        return locId;
     }
 
     function findCustomer(companyName) {
