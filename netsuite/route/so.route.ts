@@ -2,12 +2,43 @@ import { Router } from "express";
 import log from "../config/logger.config";
 import { getDb } from "../config/mongdodb.config";
 import { stageSalesOrders } from "../services/sales_order.stage";
-import { syncSalesOrdersToNetsuite, retryFailedSalesOrders } from "../services/sales_order.sync";
+import {
+    syncSalesOrdersToNetsuite,
+    syncSingleSalesOrderToNetsuite,
+    getAllStagedSalesOrderProducts,
+    resetOneStagedSalesOrderForResync,
+    retryFailedSalesOrders,
+} from "../services/sales_order.sync";
 import { migrateSalesOrderSchema, migrateMultiVendorSchema } from "../services/sales_order.migrate";
+import { persistRestSalesOrderItems } from "../services/sales_order.rest_dump";
 import { postToNetsuite } from "../services/netsuite.client";
-import { listSalesOrders, getSalesOrder, fetchAllSalesOrders } from "../services/netsuite.rest.client";
+import {
+    listSalesOrders,
+    getSalesOrder,
+    fetchAllSalesOrders,
+    hydrateSalesOrdersFromListRows,
+    extractSalesOrderIdFromListItem,
+    normalizeSalesOrderListItems,
+    restListWantDetails,
+    SALES_ORDER_FETCH_ALL_DEFAULT_MAX,
+    SALES_ORDER_FETCH_ALL_ABS_MAX,
+    SALES_ORDER_LIST_DEFAULT_LIMIT,
+    SALES_ORDER_LIST_ABS_MAX,
+} from "../services/netsuite.rest.client";
 
 const router = Router();
+
+function parsePersistDbFlag(req: any): boolean {
+    const q = req.query || {};
+    const b = req.body || {};
+    const truthy = (v: unknown) => v === true || v === "true" || v === "1" || v === 1;
+    return (
+        truthy(q.persistDb) ||
+        truthy(q.saveToDb) ||
+        truthy(b.persistDb) ||
+        truthy(b.saveToDb)
+    );
+}
 
 // ─── Direct RESTlet call ────────────────────────────────────────────────────
 router.post("/so-test", async (req: any, res: any) => {
@@ -157,6 +188,54 @@ router.get("/sync-so", async (_req: any, res: any) => {
     try {
         const results = await syncSalesOrdersToNetsuite();
         res.json({ success: true, count: results.length, results });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+router.get("/staged-so-products", async (req: any, res: any) => {
+    try {
+        const all = req.query.all === "1" || req.query.all === "true";
+        const limit = req.query.limit != null ? parseInt(req.query.limit, 10) : undefined;
+        const skip = req.query.skip != null ? parseInt(req.query.skip, 10) : undefined;
+        const data = await getAllStagedSalesOrderProducts({ limit, skip, all });
+        res.json({ success: true, ...data });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// One sync-so iteration: POST full staged doc (from GET /staged-so-products) as JSON, or { otherrefnum, order_source? } to load DB row
+router.post("/sync-so-one", async (req: any, res: any) => {
+    try {
+        const out = await syncSingleSalesOrderToNetsuite(req.body || {});
+        const badRequest =
+            out.error === "Body must include otherrefnum" ||
+            (Array.isArray((out as any).candidates) && (out as any).candidates.length > 0);
+        if (badRequest) {
+            return res.status(400).json({ success: false, ...out });
+        }
+        res.json({ success: out.success !== false, ...out });
+    } catch (e: any) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// Reset one staged SO for retry (clears ns_failed, ns_error, ns_retry_count, etc.)
+router.post("/reset-one-so", async (req: any, res: any) => {
+    try {
+        const out = await resetOneStagedSalesOrderForResync(req.body || {});
+        const badRequest =
+            out.error === "Body must include otherrefnum" ||
+            (Array.isArray(out.candidates) && out.candidates.length > 0);
+        // `out` already includes `success` — avoid `{ success, ...out }` (duplicate key + lint error).
+        if (!out.success && badRequest) {
+            return res.status(400).json(out);
+        }
+        if (!out.success) {
+            return res.status(404).json(out);
+        }
+        res.json(out);
     } catch (e: any) {
         res.status(500).json({ success: false, error: e.message });
     }
@@ -369,62 +448,239 @@ router.post("/restage-walmart", async (_req: any, res: any) => {
 /**
  * GET /salesOrder
  * List Sales Orders from NetSuite via REST API
- * 
+ *
  * Headers:
  *   Prefer: respond-async
  *   X-NetSuite-Idempotency-Key: string
- * 
+ *
  * Query:
  *   q: SuiteQL query string
- *   limit: number (default 1000)
+ *   limit: number (default SALES_ORDER_LIST_DEFAULT_LIMIT, max SALES_ORDER_LIST_ABS_MAX)
  *   offset: number (default 0)
- *   expandItems: boolean
- *   fetchAll: boolean - If true, fetches ALL pages and gets full record details for each
+ *   expandItems: boolean — passed to each per-id GET when details=true
+ *   details: boolean (default true) — after list, GET /record/v1/salesOrder/{id} for each row; false = raw list only
+ *   fetchAll: boolean — paged list + detail GETs per order (not unbounded)
+ *   maxRecords: with fetchAll, max sales orders (default SALES_ORDER_FETCH_ALL_DEFAULT_MAX, cap SALES_ORDER_FETCH_ALL_ABS_MAX)
+ *   pageSize: with fetchAll, list page size per NetSuite request (1–1000, optional)
+ *   persistDb | saveToDb: true — upsert into Mongo `ns_rest_sales_order_detail_dump` (netsuite DB).
+ *     Always persists the full per-id GET payload (even when details=false on the HTTP response).
  */
 router.get("/salesOrder", async (req: any, res: any) => {
     const prefer = req.headers.prefer;
     const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
     const fetchAll = req.query.fetchAll === "true";
+    const persistDb = parsePersistDbFlag(req);
 
     try {
-        // fetchAll mode: get all pages and full record details
+        // fetchAll: capped batch of full records (parallel detail fetches, shared NS concurrency)
         if (fetchAll) {
-            log.info("[SalesOrder List] fetchAll mode enabled - fetching all pages and details");
+            const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
+            const maxRecords = Number.isFinite(rawMax)
+                ? Math.min(Math.max(1, rawMax), SALES_ORDER_FETCH_ALL_ABS_MAX)
+                : SALES_ORDER_FETCH_ALL_DEFAULT_MAX;
+
+            const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
+            const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1_000) : undefined;
+
+            log.info(
+                `[SalesOrder List] fetchAll — maxRecords=${maxRecords}` +
+                    (pageSize != null ? `, pageSize=${pageSize}` : "")
+            );
+
             const allRecords = await fetchAllSalesOrders({
                 q: req.query.q,
                 expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
-                maxRecords: req.query.maxRecords ? parseInt(req.query.maxRecords, 10) : undefined
+                maxRecords,
+                pageSize,
+            });
+            const persistResult = await persistRestSalesOrderItems(allRecords, {
+                save: persistDb,
+                queryContext: {
+                    mode: "fetchAll",
+                    maxRecords,
+                    pageSize: pageSize ?? null,
+                    q: req.query.q ?? null,
+                    dbPayloadSource: "per_id_get",
+                },
             });
             return res.json({
                 success: true,
                 fetchAll: true,
+                maxRecords,
+                pageSize: pageSize ?? null,
                 count: allRecords.length,
-                items: allRecords
+                items: allRecords,
+                persistDb,
+                persist: persistResult,
+                limits: {
+                    defaultMax: SALES_ORDER_FETCH_ALL_DEFAULT_MAX,
+                    absMax: SALES_ORDER_FETCH_ALL_ABS_MAX,
+                },
             });
         }
 
-        const options = {
+        const rawListLimit = req.query.limit != null ? parseInt(String(req.query.limit), 10) : NaN;
+        const listLimit = Number.isFinite(rawListLimit)
+            ? Math.min(Math.max(1, rawListLimit), SALES_ORDER_LIST_ABS_MAX)
+            : SALES_ORDER_LIST_DEFAULT_LIMIT;
+
+        const rawOffset = req.query.offset != null ? parseInt(String(req.query.offset), 10) : 0;
+        const listOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+
+        const expandOnDetail = req.query.expandItems === "true" ? "item" : undefined;
+        const wantDetails = restListWantDetails(req.query);
+
+        const listOptions = {
             q: req.query.q,
-            limit: req.query.limit ? parseInt(req.query.limit, 10) : 1000,
-            offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
-            expandSubResources: req.query.expandItems === "true" ? "item" : undefined
+            limit: listLimit,
+            offset: listOffset,
+            // Always load ids from list first; line expansion happens on per-id GET when details=true
+            expandSubResources: wantDetails ? undefined : expandOnDetail,
         };
 
         if (prefer === "respond-async") {
             if (!idempotencyKey) {
                 return res.status(400).json({ success: false, error: "X-NetSuite-Idempotency-Key required for async" });
             }
-            const data = await listSalesOrders(options);
+            const data = await listSalesOrders(listOptions);
+            if (!wantDetails) {
+                const listOnly = normalizeSalesOrderListItems(data);
+                let rowsForPersist = listOnly;
+                if (persistDb && listOnly.length > 0) {
+                    log.info(
+                        `[SalesOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                    );
+                    rowsForPersist = await hydrateSalesOrdersFromListRows(listOnly, expandOnDetail);
+                }
+                const persistResult = await persistRestSalesOrderItems(rowsForPersist, {
+                    save: persistDb,
+                    queryContext: {
+                        mode: "list_only_async",
+                        limit: listLimit,
+                        offset: listOffset,
+                        q: req.query.q ?? null,
+                        dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
+                    },
+                });
+                return res.status(202).setHeader("Preference-Applied", "respond-async").json({
+                    success: true,
+                    async: true,
+                    idempotencyKey,
+                    details: false,
+                    ...data,
+                    limit: listLimit,
+                    offset: listOffset,
+                    persistDb,
+                    persist: persistResult,
+                });
+            }
+            const listItems = normalizeSalesOrderListItems(data);
+            if (wantDetails && listItems.length === 0 && data && typeof data === "object") {
+                log.warn(
+                    `[SalesOrder List] details=true but no list rows — keys: ${Object.keys(data).join(", ")}`
+                );
+            }
+            const items = await hydrateSalesOrdersFromListRows(listItems, expandOnDetail);
+            const persistResult = await persistRestSalesOrderItems(items, {
+                save: persistDb,
+                queryContext: {
+                    mode: "list_details_async",
+                    limit: listLimit,
+                    offset: listOffset,
+                    q: req.query.q ?? null,
+                    dbPayloadSource: "per_id_get",
+                },
+            });
+            const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
+            const recordDetailBase = accountHost
+                ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/salesOrder`
+                : null;
             return res.status(202).setHeader("Preference-Applied", "respond-async").json({
                 success: true,
                 async: true,
                 idempotencyKey,
-                ...data
+                details: true,
+                limit: listLimit,
+                offset: listOffset,
+                hasMore: data.hasMore,
+                totalResults: data.totalResults,
+                count: items.length,
+                ids: listItems.map((row: any) => extractSalesOrderIdFromListItem(row)).filter(Boolean),
+                recordDetailBase,
+                persistDb,
+                persist: persistResult,
+                items,
             });
         }
 
-        const data = await listSalesOrders(options);
-        return res.json({ success: true, ...data });
+        const data = await listSalesOrders(listOptions);
+
+        if (!wantDetails) {
+            const listOnly = normalizeSalesOrderListItems(data);
+            let rowsForPersist = listOnly;
+            if (persistDb && listOnly.length > 0) {
+                log.info(
+                    `[SalesOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                );
+                rowsForPersist = await hydrateSalesOrdersFromListRows(listOnly, expandOnDetail);
+            }
+            const persistResult = await persistRestSalesOrderItems(rowsForPersist, {
+                save: persistDb,
+                queryContext: {
+                    mode: "list_only",
+                    limit: listLimit,
+                    offset: listOffset,
+                    q: req.query.q ?? null,
+                    dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
+                },
+            });
+            return res.json({
+                success: true,
+                details: false,
+                ...data,
+                limit: listLimit,
+                offset: listOffset,
+                persistDb,
+                persist: persistResult,
+            });
+        }
+
+        const listItems = normalizeSalesOrderListItems(data);
+        if (wantDetails && listItems.length === 0 && data && typeof data === "object") {
+            log.warn(
+                `[SalesOrder List] details=true but no list rows — keys: ${Object.keys(data).join(", ")}`
+            );
+        }
+        const items = await hydrateSalesOrdersFromListRows(listItems, expandOnDetail);
+        const persistResult = await persistRestSalesOrderItems(items, {
+            save: persistDb,
+            queryContext: {
+                mode: "list_details",
+                limit: listLimit,
+                offset: listOffset,
+                q: req.query.q ?? null,
+                dbPayloadSource: "per_id_get",
+            },
+        });
+        const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
+        const recordDetailBase = accountHost
+            ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/salesOrder`
+            : null;
+
+        return res.json({
+            success: true,
+            details: true,
+            limit: listLimit,
+            offset: listOffset,
+            hasMore: data.hasMore,
+            totalResults: data.totalResults,
+            count: items.length,
+            ids: listItems.map((row: any) => extractSalesOrderIdFromListItem(row)).filter(Boolean),
+            recordDetailBase,
+            persistDb,
+            persist: persistResult,
+            items,
+        });
     } catch (e: any) {
         log.error("[SalesOrder List] Error:", e.message);
         res.status(500).json({ success: false, error: e.message });
@@ -434,13 +690,26 @@ router.get("/salesOrder", async (req: any, res: any) => {
 /**
  * GET /salesOrder/:id
  * Get single Sales Order by ID
+ * Query: persistDb | saveToDb — upsert this record into `ns_rest_sales_order_detail_dump`
  */
 router.get("/salesOrder/:id", async (req: any, res: any) => {
     const { id } = req.params;
     const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
+    const persistDb = parsePersistDbFlag(req);
 
     try {
         const data = await getSalesOrder(id, expandSubResources);
+        if (persistDb) {
+            const persistResult = await persistRestSalesOrderItems([data], {
+                save: true,
+                queryContext: {
+                    mode: "single_record_get",
+                    id: String(id),
+                    dbPayloadSource: "per_id_get",
+                },
+            });
+            return res.json({ success: true, data, persistDb, persist: persistResult });
+        }
         res.json({ success: true, data });
     } catch (e: any) {
         log.error(`[SalesOrder Get] ${id} Error:`, e.message);

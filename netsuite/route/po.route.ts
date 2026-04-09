@@ -4,7 +4,20 @@ import { getDb } from "../config/mongdodb.config";
 import { syncPurchaseOrdersToNetsuite, retryFailedPurchaseOrders } from "../services/po.sync";
 import { stagePurchaseOrders, resolveVendor, validateWarehouse } from "../services/po.stage";
 import { postToNetsuiteForPO } from "../services/netsuite.client";
-import { listPurchaseOrders, getPurchaseOrder, fetchAllPurchaseOrders } from "../services/netsuite.rest.client";
+import {
+    listPurchaseOrders,
+    getPurchaseOrder,
+    fetchAllPurchaseOrders,
+    hydratePurchaseOrdersFromListRows,
+    extractPurchaseOrderIdFromListItem,
+    normalizePurchaseOrderListItems,
+    restListWantDetails,
+    PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX,
+    PURCHASE_ORDER_FETCH_ALL_ABS_MAX,
+    PURCHASE_ORDER_LIST_DEFAULT_LIMIT,
+    PURCHASE_ORDER_LIST_ABS_MAX,
+} from "../services/netsuite.rest.client";
+import { persistRestPurchaseOrderItems } from "../services/purchase_order.rest_dump";
 
 // ── Warehouse map with addresses for logging ───────────────────────────────
 const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
@@ -16,6 +29,18 @@ const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> =
 };
 
 const router = Router();
+
+function parsePersistDbFlag(req: any): boolean {
+    const q = req.query || {};
+    const b = req.body || {};
+    const truthy = (v: unknown) => v === true || v === "true" || v === "1" || v === 1;
+    return (
+        truthy(q.persistDb) ||
+        truthy(q.saveToDb) ||
+        truthy(b.persistDb) ||
+        truthy(b.saveToDb)
+    );
+}
 
 // ─── Direct PO RESTlet call ─────────────────────────────────────────────────
 router.post("/po-test", async (req: any, res: any) => {
@@ -566,62 +591,224 @@ router.post("/delete-all-po", async (_req: any, res: any) => {
 /**
  * GET /purchaseOrder
  * List Purchase Orders from NetSuite via REST API
- * 
- * Headers:
- *   Prefer: respond-async
- *   X-NetSuite-Idempotency-Key: string
- * 
- * Query:
- *   q: SuiteQL query string
- *   limit: number (default 1000)
- *   offset: number (default 0)
- *   expandItems: boolean
- *   fetchAll: boolean - If true, fetches ALL pages and gets full record details for each
+ *
+ * Query: q, limit (default 200, max 1000), offset, expandItems, details (default true),
+ * fetchAll, maxRecords, pageSize, persistDb | saveToDb (Mongo always stores full per-id GET when saving)
  */
 router.get("/purchaseOrder", async (req: any, res: any) => {
     const prefer = req.headers.prefer;
     const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
     const fetchAll = req.query.fetchAll === "true";
+    const persistDb = parsePersistDbFlag(req);
 
     try {
-        // fetchAll mode: get all pages and full record details
         if (fetchAll) {
-            log.info("[PurchaseOrder List] fetchAll mode enabled - fetching all pages and details");
+            const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
+            const maxRecords = Number.isFinite(rawMax)
+                ? Math.min(Math.max(1, rawMax), PURCHASE_ORDER_FETCH_ALL_ABS_MAX)
+                : PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX;
+
+            const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
+            const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1_000) : undefined;
+
+            log.info(
+                `[PurchaseOrder List] fetchAll — maxRecords=${maxRecords}` +
+                    (pageSize != null ? `, pageSize=${pageSize}` : "")
+            );
+
             const allRecords = await fetchAllPurchaseOrders({
                 q: req.query.q,
                 expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
-                maxRecords: req.query.maxRecords ? parseInt(req.query.maxRecords, 10) : undefined
+                maxRecords,
+                pageSize,
+            });
+            const persistResult = await persistRestPurchaseOrderItems(allRecords, {
+                save: persistDb,
+                queryContext: {
+                    mode: "fetchAll",
+                    maxRecords,
+                    pageSize: pageSize ?? null,
+                    q: req.query.q ?? null,
+                    dbPayloadSource: "per_id_get",
+                },
             });
             return res.json({
                 success: true,
                 fetchAll: true,
+                maxRecords,
+                pageSize: pageSize ?? null,
                 count: allRecords.length,
-                items: allRecords
+                items: allRecords,
+                persistDb,
+                persist: persistResult,
+                limits: {
+                    defaultMax: PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX,
+                    absMax: PURCHASE_ORDER_FETCH_ALL_ABS_MAX,
+                },
             });
         }
 
-        const options = {
+        const rawListLimit = req.query.limit != null ? parseInt(String(req.query.limit), 10) : NaN;
+        const listLimit = Number.isFinite(rawListLimit)
+            ? Math.min(Math.max(1, rawListLimit), PURCHASE_ORDER_LIST_ABS_MAX)
+            : PURCHASE_ORDER_LIST_DEFAULT_LIMIT;
+
+        const rawOffset = req.query.offset != null ? parseInt(String(req.query.offset), 10) : 0;
+        const listOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+
+        const expandOnDetail = req.query.expandItems === "true" ? "item" : undefined;
+        const wantDetails = restListWantDetails(req.query);
+
+        const listOptions = {
             q: req.query.q,
-            limit: req.query.limit ? parseInt(req.query.limit, 10) : 1000,
-            offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
-            expandSubResources: req.query.expandItems === "true" ? "item" : undefined
+            limit: listLimit,
+            offset: listOffset,
+            expandSubResources: wantDetails ? undefined : expandOnDetail,
         };
 
         if (prefer === "respond-async") {
             if (!idempotencyKey) {
                 return res.status(400).json({ success: false, error: "X-NetSuite-Idempotency-Key required for async" });
             }
-            const data = await listPurchaseOrders(options);
+            const data = await listPurchaseOrders(listOptions);
+            if (!wantDetails) {
+                const listOnly = normalizePurchaseOrderListItems(data);
+                let rowsForPersist = listOnly;
+                if (persistDb && listOnly.length > 0) {
+                    log.info(
+                        `[PurchaseOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                    );
+                    rowsForPersist = await hydratePurchaseOrdersFromListRows(listOnly, expandOnDetail);
+                }
+                const persistResult = await persistRestPurchaseOrderItems(rowsForPersist, {
+                    save: persistDb,
+                    queryContext: {
+                        mode: "list_only_async",
+                        limit: listLimit,
+                        offset: listOffset,
+                        q: req.query.q ?? null,
+                        dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
+                    },
+                });
+                return res.status(202).setHeader("Preference-Applied", "respond-async").json({
+                    success: true,
+                    async: true,
+                    idempotencyKey,
+                    details: false,
+                    ...data,
+                    limit: listLimit,
+                    offset: listOffset,
+                    persistDb,
+                    persist: persistResult,
+                });
+            }
+            const listItems = normalizePurchaseOrderListItems(data);
+            if (wantDetails && listItems.length === 0 && data && typeof data === "object") {
+                log.warn(
+                    `[PurchaseOrder List] details=true but no list rows — keys: ${Object.keys(data).join(", ")}`
+                );
+            }
+            const items = await hydratePurchaseOrdersFromListRows(listItems, expandOnDetail);
+            const persistResult = await persistRestPurchaseOrderItems(items, {
+                save: persistDb,
+                queryContext: {
+                    mode: "list_details_async",
+                    limit: listLimit,
+                    offset: listOffset,
+                    q: req.query.q ?? null,
+                    dbPayloadSource: "per_id_get",
+                },
+            });
+            const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
+            const recordDetailBase = accountHost
+                ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/purchaseOrder`
+                : null;
             return res.status(202).setHeader("Preference-Applied", "respond-async").json({
                 success: true,
                 async: true,
                 idempotencyKey,
-                ...data
+                details: true,
+                limit: listLimit,
+                offset: listOffset,
+                hasMore: data.hasMore,
+                totalResults: data.totalResults,
+                count: items.length,
+                ids: listItems.map((row: any) => extractPurchaseOrderIdFromListItem(row)).filter(Boolean),
+                recordDetailBase,
+                persistDb,
+                persist: persistResult,
+                items,
             });
         }
 
-        const data = await listPurchaseOrders(options);
-        return res.json({ success: true, ...data });
+        const data = await listPurchaseOrders(listOptions);
+
+        if (!wantDetails) {
+            const listOnly = normalizePurchaseOrderListItems(data);
+            let rowsForPersist = listOnly;
+            if (persistDb && listOnly.length > 0) {
+                log.info(
+                    `[PurchaseOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                );
+                rowsForPersist = await hydratePurchaseOrdersFromListRows(listOnly, expandOnDetail);
+            }
+            const persistResult = await persistRestPurchaseOrderItems(rowsForPersist, {
+                save: persistDb,
+                queryContext: {
+                    mode: "list_only",
+                    limit: listLimit,
+                    offset: listOffset,
+                    q: req.query.q ?? null,
+                    dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
+                },
+            });
+            return res.json({
+                success: true,
+                details: false,
+                ...data,
+                limit: listLimit,
+                offset: listOffset,
+                persistDb,
+                persist: persistResult,
+            });
+        }
+
+        const listItems = normalizePurchaseOrderListItems(data);
+        if (wantDetails && listItems.length === 0 && data && typeof data === "object") {
+            log.warn(
+                `[PurchaseOrder List] details=true but no list rows — keys: ${Object.keys(data).join(", ")}`
+            );
+        }
+        const items = await hydratePurchaseOrdersFromListRows(listItems, expandOnDetail);
+        const persistResult = await persistRestPurchaseOrderItems(items, {
+            save: persistDb,
+            queryContext: {
+                mode: "list_details",
+                limit: listLimit,
+                offset: listOffset,
+                q: req.query.q ?? null,
+                dbPayloadSource: "per_id_get",
+            },
+        });
+        const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
+        const recordDetailBase = accountHost
+            ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/purchaseOrder`
+            : null;
+
+        return res.json({
+            success: true,
+            details: true,
+            limit: listLimit,
+            offset: listOffset,
+            hasMore: data.hasMore,
+            totalResults: data.totalResults,
+            count: items.length,
+            ids: listItems.map((row: any) => extractPurchaseOrderIdFromListItem(row)).filter(Boolean),
+            recordDetailBase,
+            persistDb,
+            persist: persistResult,
+            items,
+        });
     } catch (e: any) {
         log.error("[PurchaseOrder List] Error:", e.message);
         res.status(500).json({ success: false, error: e.message });
@@ -631,13 +818,26 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
 /**
  * GET /purchaseOrder/:id
  * Get single Purchase Order by ID
+ * Query: persistDb | saveToDb — upsert into `ns_rest_purchase_order_detail_dump`
  */
 router.get("/purchaseOrder/:id", async (req: any, res: any) => {
     const { id } = req.params;
     const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
+    const persistDb = parsePersistDbFlag(req);
 
     try {
         const data = await getPurchaseOrder(id, expandSubResources);
+        if (persistDb) {
+            const persistResult = await persistRestPurchaseOrderItems([data], {
+                save: true,
+                queryContext: {
+                    mode: "single_record_get",
+                    id: String(id),
+                    dbPayloadSource: "per_id_get",
+                },
+            });
+            return res.json({ success: true, data, persistDb, persist: persistResult });
+        }
         res.json({ success: true, data });
     } catch (e: any) {
         log.error(`[PurchaseOrder Get] ${id} Error:`, e.message);

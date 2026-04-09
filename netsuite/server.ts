@@ -17,6 +17,7 @@ import poRoutes from "./route/po.route";
 import diagnosticRoutes from "./route/diagnostic.route";
 import billRoutes from "./route/bill.route";
 import itemRoutes from "./route/item.route";
+import nsRestRecordRoutes from "./route/ns_rest_records.route";
 import indexRoutes from "./route/index.route";
 import { stageSalesOrders } from "./services/sales_order.stage";
 
@@ -33,6 +34,7 @@ app.use("/api/v4", poRoutes);
 app.use("/api/v4", billRoutes);
 app.use("/api/v4", diagnosticRoutes);
 app.use("/api/v4", itemRoutes);
+app.use("/api/v4", nsRestRecordRoutes);
 app.use("/api/v4", indexRoutes);
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -43,7 +45,10 @@ const server = app.listen(PORT, () => {
     log.info(`Server running at http://localhost:${PORT}`);
     log.info(`──── Sales Orders ────`);
     log.info(`  Stage SO:        GET  /stage-so`);
+    log.info(`  Staged products: GET  /staged-so-products?limit=&skip=&all=true`);
     log.info(`  Sync SO:         GET  /sync-so`);
+    log.info(`  Sync one SO:     POST /sync-so-one`);
+    log.info(`  Reset one SO:    POST /reset-one-so`);
     log.info(`  Retry Failed SO: GET  /retry-failed-so`);
     log.info(`  Reset SO Sync:   GET|POST /reset-so-sync`);
     log.info(`  Migrate SO:      GET  /migrate-so`);
@@ -79,6 +84,11 @@ const server = app.listen(PORT, () => {
     log.info(`  POs:             GET  /netsuite-po`);
     log.info(`  Diagnostic:      GET|POST /diagnostic`);
     log.info(`  Cleanup:         GET|POST /cleanup`);
+    log.info(`──── NetSuite REST record dumps (SuiteTalk) — base /api/v4 ────`);
+    log.info(`  Inventory items: GET  /api/v4/inventoryItem?persistDb=true  (+ /api/v4/inventoryItem/:id)`);
+    log.info(`  Class (NS):      GET  /api/v4/classification (+ /api/v4/classification/:id)`);
+    log.info(`  Item fulfill.:   GET  /api/v4/itemFulfillment (+ /api/v4/itemFulfillment/:id)`);
+    log.info(`  Item receipts:   GET  /api/v4/itemReceipt (+ /api/v4/itemReceipt/:id)`);
 
     // Ensure indexes after server boots (non-blocking)
     ensureIndexes().catch(err => log.error("[STARTUP] Index creation failed", { error: err.message }));
@@ -116,7 +126,47 @@ async function ensureIndexes() {
         { name: "idx_po_dropship_lookup", background: true }
     );
 
-    log.info("[STARTUP] MongoDB indexes ensured for suite_sales_order and suite_purchase_order");
+    const nsRestSoDump = nsDb.collection("ns_rest_sales_order_detail_dump");
+    await nsRestSoDump.createIndex(
+        { ns_internal_id: 1 },
+        { unique: true, name: "idx_ns_rest_so_dump_internal_id", background: true }
+    );
+    await nsRestSoDump.createIndex(
+        { dumped_at: -1 },
+        { name: "idx_ns_rest_so_dump_dumped_at", background: true }
+    );
+
+    const nsRestPoDump = nsDb.collection("ns_rest_purchase_order_detail_dump");
+    await nsRestPoDump.createIndex(
+        { ns_internal_id: 1 },
+        { unique: true, name: "idx_ns_rest_po_dump_internal_id", background: true }
+    );
+    await nsRestPoDump.createIndex(
+        { dumped_at: -1 },
+        { name: "idx_ns_rest_po_dump_dumped_at", background: true }
+    );
+
+    const restDumpSpecs: { name: string; coll: string }[] = [
+        { name: "inv_item", coll: "ns_rest_inventory_item_detail_dump" },
+        { name: "classification", coll: "ns_rest_classification_detail_dump" },
+        { name: "item_fulfillment", coll: "ns_rest_item_fulfillment_detail_dump" },
+        { name: "item_receipt", coll: "ns_rest_item_receipt_detail_dump" },
+    ];
+    for (const { name, coll } of restDumpSpecs) {
+        const c = nsDb.collection(coll);
+        await c.createIndex(
+            { ns_internal_id: 1 },
+            { unique: true, name: `idx_ns_rest_${name}_dump_internal_id`, background: true }
+        );
+        await c.createIndex(
+            { dumped_at: -1 },
+            { name: `idx_ns_rest_${name}_dump_dumped_at`, background: true }
+        );
+    }
+
+    log.info(
+        "[STARTUP] MongoDB indexes ensured for suite_sales_order, suite_purchase_order, NS REST SO/PO dump, inventory/classification/IF/IR dump collections"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -165,7 +215,7 @@ async function runSOSync() {
     }
 }
 
-cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
+// cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
 
 // ─── Every 20 min — Purchase Orders (staging + sync) ──────────────────────
 // PO at :07, :27, :47 — 7-min offset from SO to avoid API overlap.
@@ -173,24 +223,24 @@ cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
 // Batches: 50 stocking + 20 dropship per cron run, 5 parallel workers
 let poSyncRunning = false;
 
-cron.schedule("7,27,47 * * * *", async () => {
-    if (poSyncRunning) {
-        log.warn("[CRON] [PO] Skipping — previous sync still running");
-        return;
-    }
-    poSyncRunning = true;
-    try {
-        log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
-        await withTimeout(() => stagePurchaseOrders(), "PO-Stage");
+// cron.schedule("7,27,47 * * * *", async () => {
+//     if (poSyncRunning) {
+//         log.warn("[CRON] [PO] Skipping — previous sync still running");
+//         return;
+//     }
+//     poSyncRunning = true;
+//     try {
+//         log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
+//         await withTimeout(() => stagePurchaseOrders(), "PO-Stage");
 
-        log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-        await withTimeout(() => syncPurchaseOrdersToNetsuite(), "PO-Sync");
-    } catch (err: any) {
-        log.error("[CRON] [PO] Error", { error: err.message });
-    } finally {
-        poSyncRunning = false;
-    }
-});
+//         log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
+//         await withTimeout(() => syncPurchaseOrdersToNetsuite(), "PO-Sync");
+//     } catch (err: any) {
+//         log.error("[CRON] [PO] Error", { error: err.message });
+//     } finally {
+//         poSyncRunning = false;
+//     }
+// });
 
 // ─── Every 20 min — Bill sync offset from PO ─────────────────────────────
 // SO at :00/:30 → PO at :07/:27/:47 → Bill at :14/:34/:54

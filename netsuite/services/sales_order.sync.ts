@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuite } from "./netsuite.client";
 import { SYNC_MODE_SO as SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
@@ -102,7 +103,11 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
 // ═════════════════════════════════════════════════════════════════════════════
 // PROCESS ONE ORDER
 // ═════════════════════════════════════════════════════════════════════════════
-async function syncOneOrder(collection: any, order: any): Promise<any> {
+/**
+ * Same pipeline as GET /sync-so for one staged document: validate → POST SO RESTlet → mark Mongo.
+ * @param directNetSuiteCall  true = single `postToNetsuite` (sync-so-one); false = via concurrency slot (batch sync-so)
+ */
+async function syncOneOrder(collection: any, order: any, directNetSuiteCall = false): Promise<any> {
     const ref = order.otherrefnum;
 
     // ── Guard: empty items array caught before RESTlet call ──────────────────
@@ -120,20 +125,26 @@ async function syncOneOrder(collection: any, order: any): Promise<any> {
         return { otherrefnum: ref, success: false, error: err };
     }
 
+    const payload = {
+        action:              SYNC_MODE,
+        otherrefnum:         ref,
+        trandate:            order.trandate,
+        store_type:          order.store_type || "amazon",
+        order_status:        order.order_status        || "",
+        fulfillment_channel: order.fulfillment_channel || "",
+        ship_date:           order.ship_date           || null,
+        items:               order.items,
+        shipping_address:    order.shipping_address    || null,
+    };
+
     // ── Call the RESTlet ─────────────────────────────────────────────────────
     let result: any;
     try {
-        result = await withConcurrency(() => postToNetsuite({
-            action:              SYNC_MODE,
-            otherrefnum:         ref,
-            trandate:            order.trandate,
-            store_type:          order.store_type || "amazon",
-            order_status:        order.order_status        || "",
-            fulfillment_channel: order.fulfillment_channel || "",
-            ship_date:           order.ship_date           || null,
-            items:               order.items,
-            shipping_address:    order.shipping_address    || null,
-        }), `SO ${ref}`);
+        if (directNetSuiteCall) {
+            result = await postToNetsuite(payload);
+        } else {
+            result = await withConcurrency(() => postToNetsuite(payload), `SO ${ref}`);
+        }
     } catch (callErr: any) {
         // Network / auth / timeout error — mark failed and retry next run
         const errMsg = callErr?.response?.data
@@ -190,6 +201,137 @@ async function syncOneOrder(collection: any, order: any): Promise<any> {
     log.error(`[NS SO Sync] Unexpected: ${ref} → ${unexpected}`);
     await markFailed(collection, order, unexpected);
     return { otherrefnum: ref, success: false, error: unexpected };
+}
+
+/** Staged rows in `suite_sales_order` for inspection / pick list. */
+export async function getAllStagedSalesOrderProducts(options?: {
+    limit?: number;
+    skip?: number;
+    all?: boolean;
+}): Promise<{ count: number; skip: number; limit: number | "none"; products: any[] }> {
+    const skip = Math.max(Number(options?.skip) || 0, 0);
+    const ns_db = await getDb("netsuite");
+    const collection = ns_db.collection("suite_sales_order");
+
+    let cursor = collection.find({}).skip(skip);
+    let limit: number | "none" = "none";
+    if (!options?.all) {
+        const cap = Math.min(Math.max(Number(options?.limit) || 25_000, 1), 500_000);
+        limit = cap;
+        cursor = cursor.limit(cap);
+    }
+
+    const products = await cursor.toArray();
+    return { count: products.length, skip, limit, products };
+}
+
+function parseBodyObjectId(id: unknown): mongoose.Types.ObjectId | null {
+    if (id == null || id === "") return null;
+    if (id instanceof mongoose.Types.ObjectId) return id;
+    try {
+        return new mongoose.Types.ObjectId(String(id));
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Same as one loop iteration in `syncSalesOrdersToNetsuite`: `syncOneOrder(collection, order, true)`.
+ *
+ * • **Preferred:** POST the **entire** document from `GET /staged-so-products` (same shape as `find()`). That JSON is
+ *   used as `order` verbatim; only `_id` is normalized from string → ObjectId so Mongo updates work.
+ * • **Optional:** If `_id` is omitted, loads one row by `otherrefnum` + optional `order_source` (same as a single-match find).
+ */
+export async function syncSingleSalesOrderToNetsuite(body: any): Promise<any> {
+    if (!body || typeof body !== "object" || !body.otherrefnum) {
+        return { success: false, error: "Body must include otherrefnum." };
+    }
+
+    const ns_db = await getDb("netsuite");
+    const collection = ns_db.collection("suite_sales_order");
+
+    const oid = parseBodyObjectId(body._id);
+    let order: any;
+
+    if (oid) {
+        order = { ...body, _id: oid };
+    } else {
+        const ref = String(body.otherrefnum);
+        let fromDb: any = null;
+        if (body.order_source) {
+            fromDb = await collection.findOne({ otherrefnum: ref, order_source: body.order_source });
+        } else {
+            const matches = await collection.find({ otherrefnum: ref }).toArray();
+            if (matches.length === 1) fromDb = matches[0];
+            else if (matches.length > 1) {
+                return {
+                    success: false,
+                    error: `Multiple staged orders for otherrefnum "${ref}" — send full doc with _id, or include order_source.`,
+                    candidates: matches.map((m: any) => m.order_source),
+                };
+            }
+        }
+        if (!fromDb) {
+            return { success: false, error: `No staged order found for otherrefnum "${ref}".` };
+        }
+        order = fromDb;
+    }
+
+    return syncOneOrder(collection, order, true);
+}
+
+/**
+ * Clear sync failure flags on one staged row so GET /sync-so or POST /sync-so-one can pick it up again.
+ */
+export async function resetOneStagedSalesOrderForResync(body: {
+    otherrefnum: string;
+    order_source?: string;
+}): Promise<{ success: boolean; error?: string; candidates?: string[]; matched?: number; modified?: number }> {
+    if (!body?.otherrefnum) {
+        return { success: false, error: "Body must include otherrefnum" };
+    }
+
+    const ns_db = await getDb("netsuite");
+    const col = ns_db.collection("suite_sales_order");
+    const ref = String(body.otherrefnum);
+
+    let filter: Record<string, unknown>;
+    if (body.order_source) {
+        filter = { otherrefnum: ref, order_source: body.order_source };
+    } else {
+        const matches = await col.find({ otherrefnum: ref }).toArray();
+        if (matches.length === 0) {
+            return { success: false, error: `No staged order found for otherrefnum "${ref}".` };
+        }
+        if (matches.length > 1) {
+            return {
+                success: false,
+                error: `Multiple staged orders for otherrefnum "${ref}" — include order_source.`,
+                candidates: matches.map((m: any) => m.order_source),
+            };
+        }
+        filter = { otherrefnum: ref };
+    }
+
+    const r = await col.updateOne(filter, {
+        $set: { ns_synced: false },
+        $unset: {
+            ns_error: "",
+            ns_error_at: "",
+            ns_retry_count: "",
+            ns_failed: "",
+            ns_result: "",
+            ns_note: "",
+            ns_note_at: "",
+            ns_synced_at: "",
+        },
+    });
+
+    if (r.matchedCount === 0) {
+        return { success: false, error: `No staged order matched for otherrefnum "${ref}".` };
+    }
+
+    return { success: true, matched: r.matchedCount, modified: r.modifiedCount };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
