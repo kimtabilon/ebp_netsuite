@@ -1,0 +1,15 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const controller_1 = require("../controller");
+const add_class_1 = require("../controller/add_class");
+const suite_list_1 = require("../controller/suite_list");
+const sales_order_1 = require("../controller/sales_order");
+const get_list_1 = require("../controller/get_list");
+const route = (0, express_1.Router)();
+route.get('/sync', controller_1.syncMasterListToSuiteList);
+route.post("/suite-class", add_class_1.addSuiteClass);
+route.get("/suite-list", suite_list_1.getSuiteList);
+route.get("/suite-salesOrder", sales_order_1.sales_order);
+route.get("/sales-orders", get_list_1.get_all_sales_orders);
+exports.default = route;
