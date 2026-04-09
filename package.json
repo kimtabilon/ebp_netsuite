@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "net_suite": "nodemon --watch src --exec tsx netsuite/server.ts",
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').writeFileSync('dist/package.json', JSON.stringify({ type: 'commonjs' }))\"",
     "start": "node dist/server.js"
   },
   "keywords": [],
