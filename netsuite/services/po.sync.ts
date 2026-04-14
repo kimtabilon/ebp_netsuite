@@ -39,9 +39,7 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
     // Base filter: skip permanently failed and already-resolved POs.
     // update mode: re-queue everything except resolved and permanently failed
     // skip mode:   only pick up unsynced POs
-    const baseFilter = SYNC_MODE === "update"
-        ? { ns_failed: { $ne: true }, ns_result: { $nin: RESOLVED_RESULTS } }
-        : { ns_synced: { $ne: true }, ns_failed: { $ne: true }, ns_result: { $nin: RESOLVED_RESULTS } };
+    const baseFilter = { ns_synced: { $exists: false } };
 
     // ── Phase 1: Stocking POs (no SO dependency) ────────────────────────
     const stockingOrders = await collection
@@ -345,7 +343,7 @@ async function syncSerial(collection: any, orders: any[]): Promise<any[]> {
 // ─── Mark order as failed with retry tracking ────────────────────────────────
 async function markFailed(collection: any, order: any, error: any) {
     const retryCount = (order.ns_retry_count || 0) + 1;
-    const permanentlyFailed = retryCount >= MAX_RETRIES;
+    const permanentlyFailed = true; //retryCount >= MAX_RETRIES;
 
     const update: any = {
         $set: {
@@ -359,6 +357,7 @@ async function markFailed(collection: any, order: any, error: any) {
     if (permanentlyFailed) {
         update.$set.ns_failed = true;
         log.error(`[NS PO Sync] PO ${order.po_number} exceeded ${MAX_RETRIES} retries — marked as permanently failed.`);
+        console.error(`Purchase order sync failed for PO #${order.po_number}:`, error);
     }
 
     await collection.updateOne({ _id: order._id }, update);
