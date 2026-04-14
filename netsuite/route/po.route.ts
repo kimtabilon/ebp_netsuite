@@ -12,12 +12,14 @@ import {
     extractPurchaseOrderIdFromListItem,
     normalizePurchaseOrderListItems,
     restListWantDetails,
+    nsRestFetchUntilExhaustedCap,
     PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX,
     PURCHASE_ORDER_FETCH_ALL_ABS_MAX,
     PURCHASE_ORDER_LIST_DEFAULT_LIMIT,
     PURCHASE_ORDER_LIST_ABS_MAX,
 } from "../services/netsuite.rest.client";
 import { persistRestPurchaseOrderItems } from "../services/purchase_order.rest_dump";
+import { runNsRestCompareBaselineBatch, shouldRunBaselineCompareWithPersist } from "../services/ns_rest_compare.service";
 
 // ── Warehouse map with addresses for logging ───────────────────────────────
 const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
@@ -594,57 +596,87 @@ router.post("/delete-all-po", async (_req: any, res: any) => {
  *
  * Query: q, limit (default 200, max 1000), offset, expandItems, details (default true),
  * fetchAll, maxRecords, pageSize, persistDb | saveToDb (Mongo always stores full per-id GET when saving)
+ * compare: true — baseline diff vs `suite_purchase_order`; with persistDb=true compare runs by default (opt out: compare=false)
  */
 router.get("/purchaseOrder", async (req: any, res: any) => {
     const prefer = req.headers.prefer;
     const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
     const fetchAll = req.query.fetchAll === "true";
     const persistDb = parsePersistDbFlag(req);
+    const compare = shouldRunBaselineCompareWithPersist(req, persistDb);
 
     try {
         if (fetchAll) {
+            const untilExhausted = req.query.untilExhausted === "true";
             const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
-            const maxRecords = Number.isFinite(rawMax)
-                ? Math.min(Math.max(1, rawMax), PURCHASE_ORDER_FETCH_ALL_ABS_MAX)
-                : PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX;
+            const maxRecords = untilExhausted
+                ? nsRestFetchUntilExhaustedCap()
+                : Number.isFinite(rawMax)
+                  ? Math.min(Math.max(1, rawMax), PURCHASE_ORDER_FETCH_ALL_ABS_MAX)
+                  : PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX;
 
             const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
             const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1_000) : undefined;
 
             log.info(
                 `[PurchaseOrder List] fetchAll — maxRecords=${maxRecords}` +
+                    (untilExhausted ? ", untilExhausted=true" : "") +
                     (pageSize != null ? `, pageSize=${pageSize}` : "")
             );
 
             const allRecords = await fetchAllPurchaseOrders({
                 q: req.query.q,
                 expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
-                maxRecords,
+                maxRecords: untilExhausted ? undefined : maxRecords,
                 pageSize,
+                untilExhausted,
             });
             const persistResult = await persistRestPurchaseOrderItems(allRecords, {
                 save: persistDb,
                 queryContext: {
                     mode: "fetchAll",
                     maxRecords,
+                    untilExhausted,
                     pageSize: pageSize ?? null,
                     q: req.query.q ?? null,
                     dbPayloadSource: "per_id_get",
                 },
             });
+            const compareResult = compare
+                ? await runNsRestCompareBaselineBatch({
+                      variant: "purchase_order_staged",
+                      items: allRecords,
+                      extractId: extractPurchaseOrderIdFromListItem,
+                      source: {
+                          api: "purchaseOrder",
+                          mode: "fetchAll",
+                          untilExhausted,
+                          maxRecords,
+                          pageSize: pageSize ?? null,
+                      },
+                  })
+                : null;
             return res.json({
                 success: true,
                 fetchAll: true,
+                untilExhausted,
                 maxRecords,
                 pageSize: pageSize ?? null,
                 count: allRecords.length,
                 items: allRecords,
                 persistDb,
                 persist: persistResult,
-                limits: {
-                    defaultMax: PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX,
-                    absMax: PURCHASE_ORDER_FETCH_ALL_ABS_MAX,
-                },
+                compare,
+                compareResult,
+                limits: untilExhausted
+                    ? {
+                          untilExhaustedCap: nsRestFetchUntilExhaustedCap(),
+                          note: "Pages until NetSuite ends the list or cap is hit (env NS_REST_FETCH_UNTIL_EXHAUSTED_CAP).",
+                      }
+                    : {
+                          defaultMax: PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX,
+                          absMax: PURCHASE_ORDER_FETCH_ALL_ABS_MAX,
+                      },
             });
         }
 
@@ -674,9 +706,9 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
             if (!wantDetails) {
                 const listOnly = normalizePurchaseOrderListItems(data);
                 let rowsForPersist = listOnly;
-                if (persistDb && listOnly.length > 0) {
+                if ((persistDb || compare) && listOnly.length > 0) {
                     log.info(
-                        `[PurchaseOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                        `[PurchaseOrder List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`
                     );
                     rowsForPersist = await hydratePurchaseOrdersFromListRows(listOnly, expandOnDetail);
                 }
@@ -690,6 +722,19 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                         dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                     },
                 });
+                const compareResult = compare
+                    ? await runNsRestCompareBaselineBatch({
+                          variant: "purchase_order_staged",
+                          items: rowsForPersist,
+                          extractId: extractPurchaseOrderIdFromListItem,
+                          source: {
+                              api: "purchaseOrder",
+                              mode: "list_only_async",
+                              limit: listLimit,
+                              offset: listOffset,
+                          },
+                      })
+                    : null;
                 return res.status(202).setHeader("Preference-Applied", "respond-async").json({
                     success: true,
                     async: true,
@@ -700,6 +745,8 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                     offset: listOffset,
                     persistDb,
                     persist: persistResult,
+                    compare,
+                    compareResult,
                 });
             }
             const listItems = normalizePurchaseOrderListItems(data);
@@ -719,6 +766,19 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
+            const compareResult = compare
+                ? await runNsRestCompareBaselineBatch({
+                      variant: "purchase_order_staged",
+                      items,
+                      extractId: extractPurchaseOrderIdFromListItem,
+                      source: {
+                          api: "purchaseOrder",
+                          mode: "list_details_async",
+                          limit: listLimit,
+                          offset: listOffset,
+                      },
+                  })
+                : null;
             const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
             const recordDetailBase = accountHost
                 ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/purchaseOrder`
@@ -737,6 +797,8 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                 recordDetailBase,
                 persistDb,
                 persist: persistResult,
+                compare,
+                compareResult,
                 items,
             });
         }
@@ -746,9 +808,9 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
         if (!wantDetails) {
             const listOnly = normalizePurchaseOrderListItems(data);
             let rowsForPersist = listOnly;
-            if (persistDb && listOnly.length > 0) {
+            if ((persistDb || compare) && listOnly.length > 0) {
                 log.info(
-                    `[PurchaseOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                    `[PurchaseOrder List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`
                 );
                 rowsForPersist = await hydratePurchaseOrdersFromListRows(listOnly, expandOnDetail);
             }
@@ -762,6 +824,14 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                     dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                 },
             });
+            const compareResult = compare
+                ? await runNsRestCompareBaselineBatch({
+                      variant: "purchase_order_staged",
+                      items: rowsForPersist,
+                      extractId: extractPurchaseOrderIdFromListItem,
+                      source: { api: "purchaseOrder", mode: "list_only", limit: listLimit, offset: listOffset },
+                  })
+                : null;
             return res.json({
                 success: true,
                 details: false,
@@ -770,6 +840,8 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                 offset: listOffset,
                 persistDb,
                 persist: persistResult,
+                compare,
+                compareResult,
             });
         }
 
@@ -790,6 +862,14 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                 dbPayloadSource: "per_id_get",
             },
         });
+        const compareResult = compare
+            ? await runNsRestCompareBaselineBatch({
+                  variant: "purchase_order_staged",
+                  items,
+                  extractId: extractPurchaseOrderIdFromListItem,
+                  source: { api: "purchaseOrder", mode: "list_details", limit: listLimit, offset: listOffset },
+              })
+            : null;
         const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
         const recordDetailBase = accountHost
             ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/purchaseOrder`
@@ -807,6 +887,8 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
             recordDetailBase,
             persistDb,
             persist: persistResult,
+            compare,
+            compareResult,
             items,
         });
     } catch (e: any) {
@@ -819,14 +901,24 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
  * GET /purchaseOrder/:id
  * Get single Purchase Order by ID
  * Query: persistDb | saveToDb — upsert into `ns_rest_purchase_order_detail_dump`
+ *        compare — baseline diff (with persistDb=true runs by default unless compare=false)
  */
 router.get("/purchaseOrder/:id", async (req: any, res: any) => {
     const { id } = req.params;
     const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
     const persistDb = parsePersistDbFlag(req);
+    const compare = shouldRunBaselineCompareWithPersist(req, persistDb);
 
     try {
         const data = await getPurchaseOrder(id, expandSubResources);
+        const compareResult = compare
+            ? await runNsRestCompareBaselineBatch({
+                  variant: "purchase_order_staged",
+                  items: [data],
+                  extractId: extractPurchaseOrderIdFromListItem,
+                  source: { api: "purchaseOrder", mode: "single_record_get", id: String(id) },
+              })
+            : null;
         if (persistDb) {
             const persistResult = await persistRestPurchaseOrderItems([data], {
                 save: true,
@@ -836,9 +928,9 @@ router.get("/purchaseOrder/:id", async (req: any, res: any) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
-            return res.json({ success: true, data, persistDb, persist: persistResult });
+            return res.json({ success: true, data, persistDb, persist: persistResult, compare, compareResult });
         }
-        res.json({ success: true, data });
+        res.json({ success: true, data, compare, compareResult });
     } catch (e: any) {
         log.error(`[PurchaseOrder Get] ${id} Error:`, e.message);
         res.status(500).json({ success: false, error: e.message });

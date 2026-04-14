@@ -20,6 +20,13 @@ import itemRoutes from "./route/item.route";
 import nsRestRecordRoutes from "./route/ns_rest_records.route";
 import indexRoutes from "./route/index.route";
 import { stageSalesOrders } from "./services/sales_order.stage";
+import { runCronNsRestSalesOrderDump, CRON_SCHEDULE as NS_REST_SO_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_sales_order_dump";
+import { runCronNsRestPurchaseOrderDump, CRON_SCHEDULE as NS_REST_PO_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_purchase_order_dump";
+import { runCronNsRestInventoryItemDump, CRON_SCHEDULE as NS_REST_INV_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_inventory_item_dump";
+import { runCronNsRestClassificationDump, CRON_SCHEDULE as NS_REST_CLASS_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_classification_dump";
+import { runCronNsRestItemFulfillmentDump, CRON_SCHEDULE as NS_REST_IF_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_item_fulfillment_dump";
+import { runCronNsRestItemReceiptDump, CRON_SCHEDULE as NS_REST_IR_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_item_receipt_dump";
+import { NS_REST_COMPARE_LOG_COLLECTION } from "./config/ns_rest_compare.fields";
 
 dotenv.config();
 
@@ -89,6 +96,15 @@ const server = app.listen(PORT, () => {
     log.info(`  Class (NS):      GET  /api/v4/classification (+ /api/v4/classification/:id)`);
     log.info(`  Item fulfill.:   GET  /api/v4/itemFulfillment (+ /api/v4/itemFulfillment/:id)`);
     log.info(`  Item receipts:   GET  /api/v4/itemReceipt (+ /api/v4/itemReceipt/:id)`);
+    if (NS_REST_DUMP_CRONS_ENABLED) {
+        log.info(`──── NetSuite REST Mongo dumps — 8 AM & 8 PM daily (server TZ); disable: NS_REST_DUMP_CRONS_ENABLED=false ────`);
+        log.info(`  SO REST dump:    ${NS_REST_SO_DUMP_CRON}  (timeout ${NS_REST_DUMP_CRON_TIMEOUT_MS / 60_000}m)`);
+        log.info(`  PO REST dump:    ${NS_REST_PO_DUMP_CRON}`);
+        log.info(`  Inv item dump:   ${NS_REST_INV_DUMP_CRON}`);
+        log.info(`  Class dump:      ${NS_REST_CLASS_DUMP_CRON}`);
+        log.info(`  IF dump:         ${NS_REST_IF_DUMP_CRON}`);
+        log.info(`  IR dump:         ${NS_REST_IR_DUMP_CRON}`);
+    }
 
     // Ensure indexes after server boots (non-blocking)
     ensureIndexes().catch(err => log.error("[STARTUP] Index creation failed", { error: err.message }));
@@ -164,8 +180,18 @@ async function ensureIndexes() {
         );
     }
 
+    const nsRestCompareLog = nsDb.collection(NS_REST_COMPARE_LOG_COLLECTION);
+    await nsRestCompareLog.createIndex(
+        { compared_at: -1 },
+        { name: "idx_ns_rest_compare_log_compared_at", background: true }
+    );
+    await nsRestCompareLog.createIndex(
+        { record_type: 1, ns_internal_id: 1, compared_at: -1 },
+        { name: "idx_ns_rest_compare_log_type_id_time", background: true }
+    );
+
     log.info(
-        "[STARTUP] MongoDB indexes ensured for suite_sales_order, suite_purchase_order, NS REST SO/PO dump, inventory/classification/IF/IR dump collections"
+        "[STARTUP] MongoDB indexes ensured for suite_sales_order, suite_purchase_order, NS REST SO/PO dump, inventory/classification/IF/IR dump, compare diff log"
     );
 }
 
@@ -174,6 +200,10 @@ async function ensureIndexes() {
 // can never block the guard flag forever.
 // ═══════════════════════════════════════════════════════════════════════════════
 const CRON_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes — generous but finite
+
+/** Full REST record dumps can run a long time; override with NS_REST_DUMP_CRON_TIMEOUT_MS */
+const NS_REST_DUMP_CRON_TIMEOUT_MS = Number(process.env.NS_REST_DUMP_CRON_TIMEOUT_MS) || 90 * 60 * 1000;
+const NS_REST_DUMP_CRONS_ENABLED = process.env.NS_REST_DUMP_CRONS_ENABLED !== "false";
 
 function withTimeout<T>(fn: () => Promise<T>, label: string, ms = CRON_TIMEOUT_MS): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -267,26 +297,73 @@ let billSyncRunning = false;
 // });
 
 // ─── Daily 3 AM — Auto-retry permanently failed SOs ─────────────────────────
-cron.schedule("0 3 * * *", async () => {
-    log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
-    try {
-        const result = await retryFailedSalesOrders(true);
-        log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
-    } catch (err: any) {
-        log.error("[CRON] [SO-RETRY] Error", { error: err.message });
-    }
-});
+// cron.schedule("0 3 * * *", async () => {
+//     log.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
+//     try {
+//         const result = await retryFailedSalesOrders(true);
+//         log.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
+//     } catch (err: any) {
+//         log.error("[CRON] [SO-RETRY] Error", { error: err.message });
+//     }
+// });
 
-// ─── Daily 3:15 AM — Auto-retry permanently failed POs ──────────────────────
-cron.schedule("15 3 * * *", async () => {
-    log.info("[CRON] [PO-RETRY] Resetting permanently failed POs for retry...");
-    try {
-        const result = await retryFailedPurchaseOrders(true);
-        log.info(`[CRON] [PO-RETRY] Reset ${result.count} failed POs for retry`);
-    } catch (err: any) {
-        log.error("[CRON] [PO-RETRY] Error", { error: err.message });
-    }
-});
+// // ─── Daily 3:15 AM — Auto-retry permanently failed POs ──────────────────────
+// cron.schedule("15 3 * * *", async () => {
+//     log.info("[CRON] [PO-RETRY] Resetting permanently failed POs for retry...");
+//     try {
+//         const result = await retryFailedPurchaseOrders(true);
+//         log.info(`[CRON] [PO-RETRY] Reset ${result.count} failed POs for retry`);
+//     } catch (err: any) {
+//         log.error("[CRON] [PO-RETRY] Error", { error: err.message });
+//     }
+// });
+
+// ─── Twice daily (8 AM & 8 PM, staggered minutes) — NetSuite REST full dumps → Mongo ───
+// Pages until NetSuite has no more rows (cap: NS_REST_FETCH_UNTIL_EXHAUSTED_CAP). Per-id GET + line expand where supported.
+if (NS_REST_DUMP_CRONS_ENABLED) {
+    cron.schedule(NS_REST_SO_DUMP_CRON, async () => {
+        try {
+            await withTimeout(() => runCronNsRestSalesOrderDump(), "NS-REST-SO-DUMP", NS_REST_DUMP_CRON_TIMEOUT_MS);
+        } catch (err: any) {
+            log.error("[CRON] [NS-REST-SO-DUMP] Schedule error", { error: err.message });
+        }
+    });
+    cron.schedule(NS_REST_PO_DUMP_CRON, async () => {
+        try {
+            await withTimeout(() => runCronNsRestPurchaseOrderDump(), "NS-REST-PO-DUMP", NS_REST_DUMP_CRON_TIMEOUT_MS);
+        } catch (err: any) {
+            log.error("[CRON] [NS-REST-PO-DUMP] Schedule error", { error: err.message });
+        }
+    });
+    cron.schedule(NS_REST_INV_DUMP_CRON, async () => {
+        try {
+            await withTimeout(() => runCronNsRestInventoryItemDump(), "NS-REST-INV-DUMP", NS_REST_DUMP_CRON_TIMEOUT_MS);
+        } catch (err: any) {
+            log.error("[CRON] [NS-REST-INV-DUMP] Schedule error", { error: err.message });
+        }
+    });
+    cron.schedule(NS_REST_CLASS_DUMP_CRON, async () => {
+        try {
+            await withTimeout(() => runCronNsRestClassificationDump(), "NS-REST-CLASS-DUMP", NS_REST_DUMP_CRON_TIMEOUT_MS);
+        } catch (err: any) {
+            log.error("[CRON] [NS-REST-CLASS-DUMP] Schedule error", { error: err.message });
+        }
+    });
+    cron.schedule(NS_REST_IF_DUMP_CRON, async () => {
+        try {
+            await withTimeout(() => runCronNsRestItemFulfillmentDump(), "NS-REST-IF-DUMP", NS_REST_DUMP_CRON_TIMEOUT_MS);
+        } catch (err: any) {
+            log.error("[CRON] [NS-REST-IF-DUMP] Schedule error", { error: err.message });
+        }
+    });
+    cron.schedule(NS_REST_IR_DUMP_CRON, async () => {
+        try {
+            await withTimeout(() => runCronNsRestItemReceiptDump(), "NS-REST-IR-DUMP", NS_REST_DUMP_CRON_TIMEOUT_MS);
+        } catch (err: any) {
+            log.error("[CRON] [NS-REST-IR-DUMP] Schedule error", { error: err.message });
+        }
+    });
+}
 
 // ─── Daily 3:30 AM — Auto-retry permanently failed Bills ────────────────
 // cron.schedule("30 3 * * *", async () => {

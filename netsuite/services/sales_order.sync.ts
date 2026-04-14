@@ -8,6 +8,17 @@ import log from "../config/logger.config";
 const PARALLEL_WORKERS = 5;
 const BATCH_LIMIT      = 500;
 
+/** Serialize RESTlet calls per marketplace order id — avoids NetSuite RCRD_HAS_BEEN_CHANGED when workers hit the same SO. */
+const soSyncTailByRef = new Map<string, Promise<unknown>>();
+
+function runSalesOrderNetSuiteSyncSerialized<T>(otherrefnum: string, task: () => Promise<T>): Promise<T> {
+    const key = String(otherrefnum);
+    const prev = soSyncTailByRef.get(key) ?? Promise.resolve();
+    const run = prev.then(() => task());
+    soSyncTailByRef.set(key, run.then(() => undefined, () => undefined));
+    return run;
+}
+
 // ── Actions the RESTlet can return ───────────────────────────────────────────
 // "created"        → new SO created with line items          (success)
 // "updated"        → existing SO updated with line items     (success)
@@ -34,7 +45,7 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     // skip mode:   pick up only orders that were never synced at all
     const filter = SYNC_MODE === "update"
         ? {
-            ns_failed:  { $ne: true },
+            // ns_failed:  { $ne: true },
             ns_result:  { $nin: RESOLVED_RESULTS }   // don't re-queue resolved orders
           }
         : {
@@ -42,6 +53,8 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
             ns_failed:  { $ne: true },
             ns_result:  { $nin: RESOLVED_RESULTS }
           };
+
+          console.log("Fileter: " , filter);
 
     const orders = await collection.find(filter).limit(BATCH_LIMIT).toArray();
 
@@ -57,6 +70,9 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
         return syncSerial(collection, orders);
     }
 
+
+    console.log("Order:   " , orders);
+
     // ── Parallel worker pool ─────────────────────────────────────────────────
     let sent    = 0;
     let errors  = 0;
@@ -70,7 +86,9 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
             const order = orders[i];
             const t0    = Date.now();
 
-            const entry  = await syncOneOrder(collection, order);
+            const entry  = await runSalesOrderNetSuiteSyncSerialized(order.otherrefnum, () =>
+                syncOneOrder(collection, order)
+            );
             const elapsed = Date.now() - t0;
             entry.ms      = elapsed;
             results[i]    = entry;
@@ -107,7 +125,7 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
  * Same pipeline as GET /sync-so for one staged document: validate → POST SO RESTlet → mark Mongo.
  * @param directNetSuiteCall  true = single `postToNetsuite` (sync-so-one); false = via concurrency slot (batch sync-so)
  */
-async function syncOneOrder(collection: any, order: any, directNetSuiteCall = false): Promise<any> {
+async function syncOneOrder(collection: any, order: any, directNetSuiteCall = true): Promise<any> {
     const ref = order.otherrefnum;
 
     // ── Guard: empty items array caught before RESTlet call ──────────────────
@@ -135,6 +153,8 @@ async function syncOneOrder(collection: any, order: any, directNetSuiteCall = fa
         ship_date:           order.ship_date           || null,
         items:               order.items,
         shipping_address:    order.shipping_address    || null,
+        // NetSuite RESTlet: emit EBP_SO_* audit steps in Script Execution Log (set false to reduce volume).
+        ebp_diagnostic:      true,
     };
 
     // ── Call the RESTlet ─────────────────────────────────────────────────────
@@ -408,7 +428,9 @@ async function syncSerial(collection: any, orders: any[]): Promise<any[]> {
     const results: any[] = [];
 
     for (const order of orders) {
-        const entry = await syncOneOrder(collection, order);
+        const entry = await runSalesOrderNetSuiteSyncSerialized(order.otherrefnum, () =>
+            syncOneOrder(collection, order)
+        );
         results.push(entry);
 
         const action = entry.action || "";

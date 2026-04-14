@@ -21,6 +21,8 @@ export type PersistRestSalesOrderItemsResult = {
     skipped: number;
     /** Replace/upsert failures */
     errors: number;
+    /** Set when save was requested, items were non-empty, but nothing was upserted */
+    hint?: string;
 };
 
 function extractNsIdFromRestPayload(item: any): string | null {
@@ -86,6 +88,11 @@ export async function persistRestSalesOrderItems(
     }
 
     base.saved = true;
+    if (base.upserted === 0 && items.length > 0) {
+        base.hint =
+            "No documents upserted — check persist.skipped (missing ns id on rows) or persist.errors (Mongo). Collection: netsuite." +
+            NS_REST_SO_DUMP_COLLECTION;
+    }
     log.info(
         `[NS REST dump] collection=${NS_REST_SO_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
     );
