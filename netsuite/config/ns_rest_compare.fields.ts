@@ -34,3 +34,6 @@ export const NS_REST_COMPARE_FIELD_PATHS: Record<string, string[]> = {
 };
 
 export const NS_REST_COMPARE_LOG_COLLECTION = "ns_rest_compare_diff_log";
+
+/** Purchase-order baseline diffs only (sales order and other types stay on {@link NS_REST_COMPARE_LOG_COLLECTION}). */
+export const NS_REST_PO_COMPARE_LOG_COLLECTION = "ns_rest_purchase_order_compare_diff_log";

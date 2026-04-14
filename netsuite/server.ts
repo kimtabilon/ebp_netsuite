@@ -26,7 +26,10 @@ import { runCronNsRestInventoryItemDump, CRON_SCHEDULE as NS_REST_INV_DUMP_CRON 
 import { runCronNsRestClassificationDump, CRON_SCHEDULE as NS_REST_CLASS_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_classification_dump";
 import { runCronNsRestItemFulfillmentDump, CRON_SCHEDULE as NS_REST_IF_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_item_fulfillment_dump";
 import { runCronNsRestItemReceiptDump, CRON_SCHEDULE as NS_REST_IR_DUMP_CRON } from "./cron/ns_rest_dump/cron_ns_rest_item_receipt_dump";
-import { NS_REST_COMPARE_LOG_COLLECTION } from "./config/ns_rest_compare.fields";
+import {
+    NS_REST_COMPARE_LOG_COLLECTION,
+    NS_REST_PO_COMPARE_LOG_COLLECTION,
+} from "./config/ns_rest_compare.fields";
 
 dotenv.config();
 
@@ -190,8 +193,18 @@ async function ensureIndexes() {
         { name: "idx_ns_rest_compare_log_type_id_time", background: true }
     );
 
+    const nsRestPoCompareLog = nsDb.collection(NS_REST_PO_COMPARE_LOG_COLLECTION);
+    await nsRestPoCompareLog.createIndex(
+        { compared_at: -1 },
+        { name: "idx_ns_rest_po_compare_log_compared_at", background: true }
+    );
+    await nsRestPoCompareLog.createIndex(
+        { record_type: 1, ns_internal_id: 1, compared_at: -1 },
+        { name: "idx_ns_rest_po_compare_log_type_id_time", background: true }
+    );
+
     log.info(
-        "[STARTUP] MongoDB indexes ensured for suite_sales_order, suite_purchase_order, NS REST SO/PO dump, inventory/classification/IF/IR dump, compare diff log"
+        "[STARTUP] MongoDB indexes ensured for suite_sales_order, suite_purchase_order, NS REST SO/PO dump, inventory/classification/IF/IR dump, compare diff logs (general + PO)"
     );
 }
 

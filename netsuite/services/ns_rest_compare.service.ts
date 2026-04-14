@@ -38,6 +38,17 @@ export function shouldRunBaselineCompareWithPersist(req: any, persistDb: boolean
 
 export type NsRestCompareSource = Record<string, unknown>;
 
+/** Per NetSuite REST row: which baseline row was used (or why none matched). */
+export type NsBaselineCompareMatchRow = {
+    baseline_collection: string;
+    lookup_filter: Record<string, unknown>;
+    matched: boolean;
+    /** Mongo baseline document used for field diffs, when `matched` (plain JSON-safe copy). */
+    baseline_document: Record<string, unknown> | null;
+    /** e.g. ambiguous_baseline_lookup when several suite_sales_order rows share otherrefnum */
+    note?: string;
+};
+
 export type NsRestCompareBatchResult = {
     enabled: true;
     compareMode: "dump" | "baseline";
@@ -52,7 +63,44 @@ export type NsRestCompareBatchResult = {
     errors: number;
     /** When compareMode === "baseline" */
     baselineCollection?: string | null;
+    /**
+     * Key = NetSuite internal id string when known, else `no_ns_id_<n>`.
+     * Also mirrored at HTTP response root as `baselineCompare` for PO/SO list routes.
+     */
+    baselineMatches?: Record<string, NsBaselineCompareMatchRow>;
 };
+
+function baselineMatchKey(nsId: string | null, fallbackIndex: number): string {
+    if (nsId != null && String(nsId).trim() !== "") return String(nsId).trim();
+    return `no_ns_id_${fallbackIndex}`;
+}
+
+/** Shallow-safe copy for API JSON (ObjectId/Date serialize via JSON). */
+function cloneBaselineDocumentForResponse(doc: unknown): Record<string, unknown> | null {
+    if (doc == null || typeof doc !== "object") return null;
+    try {
+        return JSON.parse(JSON.stringify(doc)) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+}
+
+function recordBaselineMatch(
+    base: NsRestCompareBatchResult,
+    key: string,
+    row: NsBaselineCompareMatchRow
+): void {
+    if (!base.baselineMatches) base.baselineMatches = {};
+    base.baselineMatches[key] = row;
+}
+
+/** Spread onto `res.json({ ... })` so clients see which baseline doc backed each REST row. */
+export function baselineCompareRootField(
+    compareResult: NsRestCompareBatchResult | null | undefined
+): { baselineCompare?: Record<string, NsBaselineCompareMatchRow> } {
+    if (compareResult?.compareMode !== "baseline" || !compareResult.baselineMatches) return {};
+    return { baselineCompare: compareResult.baselineMatches };
+}
 
 /** Disambiguate `suite_sales_order` when multiple rows share the same `otherrefnum`. */
 export function parseCompareOrderSource(req: any): string | undefined {
@@ -218,6 +266,8 @@ function normalizeSuiteSalesOrderItems(dbVal: unknown): { item: string; quantity
 
 function restPoLineSku(line: any): string {
     if (line == null || typeof line !== "object") return "";
+    const vn = line.vendorName;
+    if (vn != null && String(vn).trim() !== "") return String(vn).trim();
     const it = line.item;
     if (it != null && typeof it === "object") {
         return String(it.refName ?? it.id ?? "").trim();
@@ -263,6 +313,48 @@ function normalizeSuitePurchaseOrderItems(dbVal: unknown): { sku: string; qty: n
     return out;
 }
 
+function stripLeadingVendorIndexFromRefName(v: unknown): string {
+    return String(v ?? "")
+        .trim()
+        .replace(/^\d+\s+/, "")
+        .trim();
+}
+
+/** Matches `WAREHOUSE_MAP` / `resolveLocation` names in `purchase_order_restlet.js`. */
+const NS_PO_LOCATION_REF_TO_CODE: Record<string, string> = {
+    "california - chatsworth": "MW",
+    "ware2go - pa (fairless hills)": "W2G-PA",
+    "ware2go - il (aurora)": "W2G-IL",
+    "ware2go - ky (hebron)": "W2G-KY",
+    "ware2go - tx (dallas)": "W2G-TX",
+    dropship: "",
+};
+
+function locationRefToWarehouseCode(v: unknown): string {
+    const raw = String(v ?? "").trim();
+    if (!raw) return "";
+    const k = raw.toLowerCase();
+    if (k === "dropship") return "";
+    return NS_PO_LOCATION_REF_TO_CODE[k] ?? raw;
+}
+
+function normalizeSuitePoInvoiceForCompare(dbVal: unknown): unknown {
+    if (!Array.isArray(dbVal)) return [];
+    const simplified = dbVal.map((inv) => {
+        if (inv == null || typeof inv !== "object") return inv;
+        const o = inv as Record<string, unknown>;
+        return {
+            invoiceNumber: o.invoiceNumber != null ? String(o.invoiceNumber) : "",
+            invoiceDate: o.invoiceDate != null ? String(o.invoiceDate) : "",
+            totalAmount: o.totalAmount != null ? String(o.totalAmount) : "",
+        };
+    });
+    simplified.sort((a: any, b: any) =>
+        String(a.invoiceNumber).localeCompare(String(b.invoiceNumber))
+    );
+    return simplified;
+}
+
 function applyBaselineCoerce(
     spec: BaselineCompareFieldSpec,
     restVal: unknown,
@@ -286,13 +378,30 @@ function applyBaselineCoerce(
             dv = normalizeDateLoose(dv);
             break;
         }
+        case "lowercase_string": {
+            rv = rv != null && String(rv).trim() !== "" ? String(rv).trim().toLowerCase() : "";
+            dv = dv != null && String(dv).trim() !== "" ? String(dv).trim().toLowerCase() : "";
+            break;
+        }
+        case "netsuite_vendor_refname": {
+            rv = stripLeadingVendorIndexFromRefName(rv);
+            const dStr = String(dv ?? "").trim();
+            rv = String(rv ?? "").trim().toLowerCase();
+            dv = dStr.toLowerCase();
+            break;
+        }
+        case "warehouse_from_location_refname": {
+            rv = locationRefToWarehouseCode(rv);
+            dv = String(dv ?? "").trim();
+            break;
+        }
         default:
             break;
     }
     return { rv, dv };
 }
 
-/** Uses `compareFields` from baseline config; skips entries with empty `restPath`. */
+/** Uses `compareFields` from baseline config; skips entries with empty `restPath` (except `arrayCompare`-only rows). */
 function buildBaselineCompareDiffs(
     restObj: unknown,
     dbObj: unknown,
@@ -300,6 +409,19 @@ function buildBaselineCompareDiffs(
 ): { path: string; before: unknown; after: unknown }[] {
     const diffs: { path: string; before: unknown; after: unknown }[] = [];
     for (const spec of specs) {
+        if (spec.arrayCompare === "purchase_order_invoice") {
+            const rv: unknown = [];
+            const dv: unknown = normalizeSuitePoInvoiceForCompare(getAtPath(dbObj, spec.dbField));
+            if (!valuesEqual(rv, dv)) {
+                diffs.push({
+                    path: `(no SuiteTalk invoice list)=>${spec.dbField} (EBP invoice[] vs [])`,
+                    before: dv,
+                    after: rv,
+                });
+            }
+            continue;
+        }
+
         if (!spec.restPath || String(spec.restPath).trim() === "") continue;
 
         if (spec.arrayCompare === "sales_order_lines") {
@@ -341,6 +463,16 @@ function buildBaselineCompareDiffs(
         }
 
         let rv = getAtPath(restObj, spec.restPath);
+        if (
+            spec.dbField === "status" &&
+            spec.restPath === "custbody1" &&
+            (rv == null || String(rv).trim() === "")
+        ) {
+            rv = getAtPath(restObj, "status.refName");
+        }
+        if (spec.dbField === "distributor" && (rv == null || String(rv).trim() === "")) {
+            rv = getAtPath(restObj, "entity.refName");
+        }
         let dv = getAtPath(dbObj, spec.dbField);
         if (spec.coerce) {
             const coerced = applyBaselineCoerce(spec, rv, dv);
@@ -364,7 +496,16 @@ function restOtherRefForSuiteSo(rest: any): string | null {
     return null;
 }
 
+/**
+ * Baseline `po_number` matches NetSuite `otherrefnum` (see `po.sync.ts` + `purchase_order_restlet.js`).
+ * Prefer that over `tranId` digits (e.g. PO1000000 vs business po_number).
+ */
 function restPoNumberForSuite(rest: any): number | null {
+    const ref = restOtherRefForSuiteSo(rest);
+    if (ref) {
+        const n = digitsToNumber(ref);
+        if (n != null && !Number.isNaN(n)) return n;
+    }
     const tr = rest?.tranId != null ? String(rest.tranId) : "";
     const m = tr.match(/(\d+)/);
     if (m) return parseInt(m[1], 10);
@@ -516,8 +657,11 @@ export async function runNsRestCompareBaselineBatch(options: {
     source: NsRestCompareSource;
     /** For sales_order_staged: narrows `suite_sales_order` when several rows share `otherrefnum`. */
     orderSource?: string | undefined;
+    /** Default: {@link NS_REST_COMPARE_LOG_COLLECTION}. Purchase orders use `NS_REST_PO_COMPARE_LOG_COLLECTION`. */
+    logCollection?: string;
 }): Promise<NsRestCompareBatchResult> {
     const cfg = NS_BASELINE_COMPARE[options.variant];
+    const logCollName = options.logCollection ?? NS_REST_COMPARE_LOG_COLLECTION;
     const base: NsRestCompareBatchResult = {
         enabled: true,
         compareMode: "baseline",
@@ -528,9 +672,10 @@ export async function runNsRestCompareBaselineBatch(options: {
         skippedAmbiguous: 0,
         newInNetsuite: 0,
         fieldMismatches: 0,
-        logCollection: NS_REST_COMPARE_LOG_COLLECTION,
+        logCollection: logCollName,
         errors: 0,
         baselineCollection: cfg.baselineCollection,
+        baselineMatches: {},
     };
 
     const compareFields = cfg.compareFields;
@@ -540,7 +685,7 @@ export async function runNsRestCompareBaselineBatch(options: {
 
     const nsDb = await getDb("netsuite");
     const baselineCol = nsDb.collection(cfg.baselineCollection);
-    const logCol = nsDb.collection(NS_REST_COMPARE_LOG_COLLECTION);
+    const logCol = nsDb.collection(logCollName);
     const now = new Date();
 
     const validItems: { item: any; nsId: string | null }[] = [];
@@ -660,6 +805,13 @@ export async function runNsRestCompareBaselineBatch(options: {
             const ref = restOtherRefForSuiteSo(item);
             if (!ref) {
                 base.skippedNoId++;
+                recordBaselineMatch(base, baselineMatchKey(nsId, base.comparedRows), {
+                    baseline_collection: cfg.baselineCollection,
+                    lookup_filter: {},
+                    matched: false,
+                    baseline_document: null,
+                    note: "missing_other_ref_num_on_rest_payload",
+                });
                 continue;
             }
             const candidates = soByRef?.get(ref) ?? [];
@@ -692,12 +844,26 @@ export async function runNsRestCompareBaselineBatch(options: {
                     base.errors++;
                     log.error(`[NS REST compare baseline] log insert:`, err?.message || err);
                 }
+                recordBaselineMatch(base, baselineMatchKey(nsId, base.comparedRows), {
+                    baseline_collection: cfg.baselineCollection,
+                    lookup_filter: { otherrefnum: ref },
+                    matched: false,
+                    baseline_document: null,
+                    note: "ambiguous_baseline_lookup",
+                });
                 continue;
             }
         } else if (options.variant === "purchase_order_staged") {
             const n = restPoNumberForSuite(item);
             if (n == null) {
                 base.skippedNoId++;
+                recordBaselineMatch(base, baselineMatchKey(nsId, base.comparedRows), {
+                    baseline_collection: cfg.baselineCollection,
+                    lookup_filter: {},
+                    matched: false,
+                    baseline_document: null,
+                    note: "missing_po_number_from_otherrefnum_or_tranid",
+                });
                 continue;
             }
             baselineDoc = poByNum?.get(n) ?? null;
@@ -706,6 +872,13 @@ export async function runNsRestCompareBaselineBatch(options: {
             const id = nsId ?? extractNsRestIdForCompare(item, options.extractId);
             if (!id) {
                 base.skippedNoId++;
+                recordBaselineMatch(base, baselineMatchKey(null, base.comparedRows), {
+                    baseline_collection: cfg.baselineCollection,
+                    lookup_filter: {},
+                    matched: false,
+                    baseline_document: null,
+                    note: "missing_internal_id_for_inventory_compare",
+                });
                 continue;
             }
             baselineDoc = itemByInternal?.get(String(id)) ?? null;
@@ -714,11 +887,25 @@ export async function runNsRestCompareBaselineBatch(options: {
             const id = nsId ?? extractNsRestIdForCompare(item, options.extractId);
             if (!id) {
                 base.skippedNoId++;
+                recordBaselineMatch(base, baselineMatchKey(null, base.comparedRows), {
+                    baseline_collection: cfg.baselineCollection,
+                    lookup_filter: {},
+                    matched: false,
+                    baseline_document: null,
+                    note: "missing_internal_id_for_classification_compare",
+                });
                 continue;
             }
             baselineDoc = classMap?.get(String(id)) ?? null;
             lookupFilter = { internalid: id };
         }
+
+        recordBaselineMatch(base, baselineMatchKey(nsId, base.comparedRows), {
+            baseline_collection: cfg.baselineCollection,
+            lookup_filter: lookupFilter,
+            matched: baselineDoc != null,
+            baseline_document: baselineDoc != null ? cloneBaselineDocumentForResponse(baselineDoc) : null,
+        });
 
         if (baselineDoc == null) {
             base.newInNetsuite++;

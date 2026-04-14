@@ -19,7 +19,12 @@ import {
     PURCHASE_ORDER_LIST_ABS_MAX,
 } from "../services/netsuite.rest.client";
 import { persistRestPurchaseOrderItems } from "../services/purchase_order.rest_dump";
-import { runNsRestCompareBaselineBatch, shouldRunBaselineCompareWithPersist } from "../services/ns_rest_compare.service";
+import { NS_REST_PO_COMPARE_LOG_COLLECTION } from "../config/ns_rest_compare.fields";
+import {
+    baselineCompareRootField,
+    runNsRestCompareBaselineBatch,
+    shouldRunBaselineCompareWithPersist,
+} from "../services/ns_rest_compare.service";
 
 // ── Warehouse map with addresses for logging ───────────────────────────────
 const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
@@ -645,6 +650,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
             const compareResult = compare
                 ? await runNsRestCompareBaselineBatch({
                       variant: "purchase_order_staged",
+                      logCollection: NS_REST_PO_COMPARE_LOG_COLLECTION,
                       items: allRecords,
                       extractId: extractPurchaseOrderIdFromListItem,
                       source: {
@@ -668,6 +674,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                 persist: persistResult,
                 compare,
                 compareResult,
+                ...baselineCompareRootField(compareResult),
                 limits: untilExhausted
                     ? {
                           untilExhaustedCap: nsRestFetchUntilExhaustedCap(),
@@ -725,6 +732,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                 const compareResult = compare
                     ? await runNsRestCompareBaselineBatch({
                           variant: "purchase_order_staged",
+                          logCollection: NS_REST_PO_COMPARE_LOG_COLLECTION,
                           items: rowsForPersist,
                           extractId: extractPurchaseOrderIdFromListItem,
                           source: {
@@ -747,6 +755,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                     persist: persistResult,
                     compare,
                     compareResult,
+                    ...baselineCompareRootField(compareResult),
                 });
             }
             const listItems = normalizePurchaseOrderListItems(data);
@@ -769,6 +778,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
             const compareResult = compare
                 ? await runNsRestCompareBaselineBatch({
                       variant: "purchase_order_staged",
+                      logCollection: NS_REST_PO_COMPARE_LOG_COLLECTION,
                       items,
                       extractId: extractPurchaseOrderIdFromListItem,
                       source: {
@@ -799,6 +809,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                 persist: persistResult,
                 compare,
                 compareResult,
+                ...baselineCompareRootField(compareResult),
                 items,
             });
         }
@@ -827,6 +838,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
             const compareResult = compare
                 ? await runNsRestCompareBaselineBatch({
                       variant: "purchase_order_staged",
+                      logCollection: NS_REST_PO_COMPARE_LOG_COLLECTION,
                       items: rowsForPersist,
                       extractId: extractPurchaseOrderIdFromListItem,
                       source: { api: "purchaseOrder", mode: "list_only", limit: listLimit, offset: listOffset },
@@ -842,6 +854,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
                 persist: persistResult,
                 compare,
                 compareResult,
+                ...baselineCompareRootField(compareResult),
             });
         }
 
@@ -865,6 +878,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
         const compareResult = compare
             ? await runNsRestCompareBaselineBatch({
                   variant: "purchase_order_staged",
+                  logCollection: NS_REST_PO_COMPARE_LOG_COLLECTION,
                   items,
                   extractId: extractPurchaseOrderIdFromListItem,
                   source: { api: "purchaseOrder", mode: "list_details", limit: listLimit, offset: listOffset },
@@ -889,6 +903,7 @@ router.get("/purchaseOrder", async (req: any, res: any) => {
             persist: persistResult,
             compare,
             compareResult,
+            ...baselineCompareRootField(compareResult),
             items,
         });
     } catch (e: any) {
@@ -914,6 +929,7 @@ router.get("/purchaseOrder/:id", async (req: any, res: any) => {
         const compareResult = compare
             ? await runNsRestCompareBaselineBatch({
                   variant: "purchase_order_staged",
+                  logCollection: NS_REST_PO_COMPARE_LOG_COLLECTION,
                   items: [data],
                   extractId: extractPurchaseOrderIdFromListItem,
                   source: { api: "purchaseOrder", mode: "single_record_get", id: String(id) },
@@ -928,9 +944,23 @@ router.get("/purchaseOrder/:id", async (req: any, res: any) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
-            return res.json({ success: true, data, persistDb, persist: persistResult, compare, compareResult });
+            return res.json({
+                success: true,
+                data,
+                persistDb,
+                persist: persistResult,
+                compare,
+                compareResult,
+                ...baselineCompareRootField(compareResult),
+            });
         }
-        res.json({ success: true, data, compare, compareResult });
+        res.json({
+            success: true,
+            data,
+            compare,
+            compareResult,
+            ...baselineCompareRootField(compareResult),
+        });
     } catch (e: any) {
         log.error(`[PurchaseOrder Get] ${id} Error:`, e.message);
         res.status(500).json({ success: false, error: e.message });

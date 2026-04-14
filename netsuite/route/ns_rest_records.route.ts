@@ -46,7 +46,12 @@ import { persistRestClassificationRows, NS_REST_CLASSIFICATION_DUMP_COLLECTION }
 import { persistRestItemFulfillmentRows, NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION } from "../services/item_fulfillment.rest_dump";
 import { persistRestItemReceiptRows, NS_REST_ITEM_RECEIPT_DUMP_COLLECTION } from "../services/item_receipt.rest_dump";
 import type { BaselineCompareVariant } from "../config/ns_baseline_compare.config";
-import { runNsRestCompareBaselineBatch, runNsRestCompareBatch, parseCompareFlag } from "../services/ns_rest_compare.service";
+import {
+    baselineCompareRootField,
+    runNsRestCompareBaselineBatch,
+    runNsRestCompareBatch,
+    parseCompareFlag,
+} from "../services/ns_rest_compare.service";
 
 const router = Router();
 
@@ -210,6 +215,7 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     persist: enrichPersistResult(persistResult, persistDb, allRecords.length),
                     compare,
                     compareResult,
+                    ...baselineCompareRootField(compareResult),
                     limits: untilExhausted
                         ? {
                               untilExhaustedCap: nsRestFetchUntilExhaustedCap(),
@@ -284,6 +290,7 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                         persist: enrichPersistResult(persistResult, persistDb, rowsForPersist.length),
                         compare,
                         compareResult,
+                        ...baselineCompareRootField(compareResult),
                     });
                 }
                 const listItems = normalizeRestRecordListItems(data);
@@ -331,6 +338,7 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     persist: enrichPersistResult(persistResult, persistDb, items.length),
                     compare,
                     compareResult,
+                    ...baselineCompareRootField(compareResult),
                     items,
                 });
             }
@@ -374,6 +382,7 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     persist: enrichPersistResult(persistResult, persistDb, rowsForPersist.length),
                     compare,
                     compareResult,
+                    ...baselineCompareRootField(compareResult),
                 });
             }
 
@@ -421,6 +430,7 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                 persist: enrichPersistResult(persistResult, persistDb, items.length),
                 compare,
                 compareResult,
+                ...baselineCompareRootField(compareResult),
                 items,
             });
         } catch (e: any) {
@@ -460,9 +470,16 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     persist: enrichPersistResult(persistResult, persistDb, 1),
                     compare,
                     compareResult,
+                    ...baselineCompareRootField(compareResult),
                 });
             }
-            res.json({ success: true, data, compare, compareResult });
+            res.json({
+                success: true,
+                data,
+                compare,
+                compareResult,
+                ...baselineCompareRootField(compareResult),
+            });
         } catch (e: any) {
             log.error(`[${cfg.logLabel} Get] ${id} Error:`, e.message);
             res.status(500).json({ success: false, error: e.message });

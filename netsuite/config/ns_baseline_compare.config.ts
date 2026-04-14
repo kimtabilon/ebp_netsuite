@@ -11,10 +11,20 @@ export type BaselineCompareCoerce =
     /** entity.id (string/number) vs vendor_id */
     | "numeric_id"
     /** ISO or Date-like string vs Date in Mongo */
-    | "date_loose";
+    | "date_loose"
+    /** E.g. "Invoiced" vs "invoiced" */
+    | "lowercase_string"
+    /** SuiteTalk `entity.refName` often has a numeric index prefix vs plain distributor string in Mongo */
+    | "netsuite_vendor_refname"
+    /** `location.refName` (NetSuite) vs `stocking_warehouse` code (MW, W2G-IL, …); DropShip → "" */
+    | "warehouse_from_location_refname";
 
 /** Semantic line-list compare (not raw REST JSON vs staging). */
-export type BaselineArrayCompareMode = "sales_order_lines" | "purchase_order_lines";
+export type BaselineArrayCompareMode =
+    | "sales_order_lines"
+    | "purchase_order_lines"
+    /** EBP `invoice` on suite_purchase_order vs no equivalent on SuiteTalk PO — REST treated as []. */
+    | "purchase_order_invoice";
 
 export type BaselineCompareFieldSpec = {
     /** Field on the baseline Mongo document (e.g. suite_sales_order) */
@@ -79,13 +89,27 @@ export const NS_BASELINE_COMPARE: Record<
         baselineCollection: "suite_purchase_order",
         logRecordType: "purchase_order",
         compareFields: [
-            { dbField: "po_number", kind: "number", restPath: "tranId", coerce: "digits_to_number" },
-            { dbField: "website_order_number", kind: "string", restPath: "otherRefNum" },
-            { dbField: "distributor", kind: "string", restPath: "entity.refName" },
-            { dbField: "distributor_order_number", kind: "string", restPath: "" },
-            { dbField: "status", kind: "string", restPath: "status.refName" },
-            { dbField: "invoice", kind: "array", restPath: "" },
+            /** Sync sets `otherrefnum` = po_number — use before `tranId` (e.g. PO224305 vs internal-style tranId). */
+            { dbField: "po_number", kind: "number", restPath: "otherRefNum", coerce: "digits_to_number" },
+            /** Not written on the PO header by the EBP RESTlet today — no stable SuiteTalk path; skipped until mapped. */
+            { dbField: "website_order_number", kind: "string", restPath: "" },
+            {
+                dbField: "distributor",
+                kind: "string",
+                restPath: "custbody_otherrefnumber_custom",
+                coerce: "netsuite_vendor_refname",
+            },
+            { dbField: "distributor_order_number", kind: "string", restPath: "custbody2" },
+            /** RESTlet stores EBP status in `custbody1`, not standard PO workflow status. */
+            { dbField: "status", kind: "string", restPath: "custbody1", coerce: "lowercase_string" },
+            {
+                dbField: "invoice",
+                kind: "array",
+                restPath: "",
+                arrayCompare: "purchase_order_invoice",
+            },
             { dbField: "vendor_id", kind: "number", restPath: "entity.id", coerce: "numeric_id" },
+            /** Not set by EBP PO RESTlet on the header — skip until you expose tracking on a body field. */
             { dbField: "tracking", kind: "string", restPath: "" },
             {
                 dbField: "order_items",
@@ -93,8 +117,16 @@ export const NS_BASELINE_COMPARE: Record<
                 restPath: "item.items",
                 arrayCompare: "purchase_order_lines",
             },
+            /** Not persisted on the PO record by the RESTlet — skip. */
             { dbField: "po_type", kind: "string", restPath: "" },
-            { dbField: "stocking_warehouse", kind: "string", restPath: "location.refName" },
+            {
+                dbField: "stocking_warehouse",
+                kind: "string",
+                restPath: "location.refName",
+                coerce: "warehouse_from_location_refname",
+            },
+            { dbField: "created_at", kind: "string", restPath: "createdDate", coerce: "date_loose" },
+            { dbField: "updated_at", kind: "string", restPath: "lastModifiedDate", coerce: "date_loose" },
         ],
     },
     inventory_item_full: {

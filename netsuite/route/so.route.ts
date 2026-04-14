@@ -12,6 +12,7 @@ import {
 import { migrateSalesOrderSchema, migrateMultiVendorSchema } from "../services/sales_order.migrate";
 import { persistRestSalesOrderItems, NS_REST_SO_DUMP_COLLECTION } from "../services/sales_order.rest_dump";
 import {
+    baselineCompareRootField,
     runNsRestCompareBaselineBatch,
     parseCompareOrderSource,
     shouldRunBaselineCompareWithPersist,
@@ -546,6 +547,7 @@ router.get("/salesOrder", async (req: any, res: any) => {
                 persist: persistResult,
                 compare,
                 compareResult,
+                ...baselineCompareRootField(compareResult),
                 limits: untilExhausted
                     ? {
                           untilExhaustedCap: nsRestFetchUntilExhaustedCap(),
@@ -622,6 +624,7 @@ router.get("/salesOrder", async (req: any, res: any) => {
                     persist: persistResult,
                     compare,
                     compareResult,
+                    ...baselineCompareRootField(compareResult),
                 });
             }
             const listItems = normalizeSalesOrderListItems(data);
@@ -670,6 +673,7 @@ router.get("/salesOrder", async (req: any, res: any) => {
                 persist: persistResult,
                 compare,
                 compareResult,
+                ...baselineCompareRootField(compareResult),
                 items,
             });
         }
@@ -714,6 +718,7 @@ router.get("/salesOrder", async (req: any, res: any) => {
                 persist: persistResult,
                 compare,
                 compareResult,
+                ...baselineCompareRootField(compareResult),
             });
         }
 
@@ -762,6 +767,7 @@ router.get("/salesOrder", async (req: any, res: any) => {
             persist: persistResult,
             compare,
             compareResult,
+            ...baselineCompareRootField(compareResult),
             items,
         });
     } catch (e: any) {
@@ -802,9 +808,23 @@ router.get("/salesOrder/:id", async (req: any, res: any) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
-            return res.json({ success: true, data, persistDb, persist: persistResult, compare, compareResult });
+            return res.json({
+                success: true,
+                data,
+                persistDb,
+                persist: persistResult,
+                compare,
+                compareResult,
+                ...baselineCompareRootField(compareResult),
+            });
         }
-        res.json({ success: true, data, compare, compareResult });
+        res.json({
+            success: true,
+            data,
+            compare,
+            compareResult,
+            ...baselineCompareRootField(compareResult),
+        });
     } catch (e: any) {
         log.error(`[SalesOrder Get] ${id} Error:`, e.message);
         res.status(500).json({ success: false, error: e.message });
