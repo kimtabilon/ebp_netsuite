@@ -174,10 +174,12 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
 
     log.info(`[PO Stage] Found ${staged.length} POs matching filter`);
 
-    if (staged.length > 0) {
-        log.info("[PO Stage] Upserting to netsuite.suite_purchase_order...");
+    const staged_with_items = staged.filter(po => po.order_items && po.order_items.length > 0);
+
+    if (staged_with_items.length > 0) {
+        log.info(`[PO Stage] Upserting ${staged_with_items.length} POs with items to netsuite.suite_purchase_order...`);
         await ns_db.collection<StagedPO>("suite_purchase_order").bulkWrite(
-            staged.map(po => ({
+            staged_with_items.map(po => ({
                 updateOne: {
                     filter: { po_number: po.po_number },
                     update: { $set: po },
@@ -187,6 +189,6 @@ export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
         );
     }
 
-    log.info(`[PO Stage] Staged ${staged.length} purchase orders to netsuite.suite_purchase_order`);
-    return { processed: staged.length };
+    log.info(`[PO Stage] Staged ${staged_with_items.length} purchase orders to netsuite.suite_purchase_order`);
+    return { processed: staged_with_items.length };
 };

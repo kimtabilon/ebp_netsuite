@@ -381,10 +381,12 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
     log.info(`[SO Stage] Built — Amazon: ${amazonOrders.length}, Newegg: ${neweggOrders.length}, Walmart: ${walmartOrders.length}, TPX: ${tpxOrders.length}, Total: ${sales_orders.length}`);
 
     // ── Upsert into netsuite.suite_sales_order (staging) ────────────────────
-    log.info(`[SO Stage] Upserting ${sales_orders.length} sales orders...`);
-    if (sales_orders.length > 0) {
+    const sales_orders_with_items = sales_orders.filter(order => order.items && order.items.length > 0);
+
+    log.info(`[SO Stage] Upserting ${sales_orders_with_items.length} sales orders with items...`);
+    if (sales_orders_with_items.length > 0) {
         await ns_db.collection<SalesOrder>("suite_sales_order").bulkWrite(
-            sales_orders.map(order => ({
+            sales_orders_with_items.map(order => ({
                 updateOne: {
                     filter: { otherrefnum: order.otherrefnum, order_source: order.order_source },
                     update: { $set: order },
@@ -394,6 +396,6 @@ export const stageSalesOrders = async (): Promise<{ processed: number }> => {
         );
     }
 
-    log.info(`[SO Stage] Staged ${sales_orders.length} sales orders to netsuite.suite_sales_order`);
-    return { processed: sales_orders.length };
+    log.info(`[SO Stage] Staged ${sales_orders_with_items.length} sales orders to netsuite.suite_sales_order`);
+    return { processed: sales_orders_with_items.length };
 };
