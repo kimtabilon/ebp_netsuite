@@ -45,13 +45,10 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     // skip mode:   pick up only orders that were never synced at all
     const filter = SYNC_MODE === "update"
         ? {
-            // ns_failed:  { $ne: true },
-            ns_result:  { $nin: RESOLVED_RESULTS }   // don't re-queue resolved orders
+            ns_synced: { $exists: false }
           }
         : {
-            ns_synced:  { $ne: true },
-            ns_failed:  { $ne: true },
-            ns_result:  { $nin: RESOLVED_RESULTS }
+            ns_synced: { $exists: false }
           };
 
           console.log("Fileter: " , filter);
@@ -401,7 +398,7 @@ async function markResolved(
  */
 async function markFailed(collection: any, order: any, error: any) {
     const retryCount       = (order.ns_retry_count || 0) + 1;
-    const permanentlyFailed = retryCount >= MAX_RETRIES;
+    const permanentlyFailed = true; //retryCount >= MAX_RETRIES;
 
     const setFields: any = {
         ns_synced:      false,
