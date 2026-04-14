@@ -51,8 +51,21 @@ const post = async (scriptId: string, deployId: string, payload: object): Promis
             },
             timeout: RESTLET_TIMEOUT_MS,
         });
-        log.debug("[NS Client] Response", { action: response.data?.action, success: response.data?.success, itemCount: response.data?.fetch_items_fast?.count });
-        return response.data;
+        const data = response.data;
+        if (data && data.success === false) {
+            const detail =
+                typeof data === "object"
+                    ? JSON.stringify(data)
+                    : String(data);
+            log.warn(`[NS Client] RESTlet success:false → ${detail.slice(0, 8000)}${detail.length > 8000 ? "…(truncated)" : ""}`);
+        } else {
+            log.debug("[NS Client] Response", {
+                action: data?.action,
+                success: data?.success,
+                itemCount: data?.fetch_items_fast?.count,
+            });
+        }
+        return data;
     } catch (err: any) {
         const status = err.response?.status;
         const body = err.response?.data;

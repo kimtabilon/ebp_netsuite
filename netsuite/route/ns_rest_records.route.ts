@@ -3,6 +3,7 @@ import log from "../config/logger.config";
 import {
     restListWantDetails,
     normalizeRestRecordListItems,
+    nsRestFetchUntilExhaustedCap,
     listInventoryItems,
     getInventoryItem,
     fetchAllInventoryItems,
@@ -40,10 +41,12 @@ import {
     ITEM_RECEIPT_LIST_DEFAULT_LIMIT,
     ITEM_RECEIPT_LIST_ABS_MAX,
 } from "../services/netsuite.rest.client";
-import { persistRestInventoryItemRows } from "../services/inventory_item.rest_dump";
-import { persistRestClassificationRows } from "../services/classification.rest_dump";
-import { persistRestItemFulfillmentRows } from "../services/item_fulfillment.rest_dump";
-import { persistRestItemReceiptRows } from "../services/item_receipt.rest_dump";
+import { persistRestInventoryItemRows, NS_REST_INVENTORY_ITEM_DUMP_COLLECTION } from "../services/inventory_item.rest_dump";
+import { persistRestClassificationRows, NS_REST_CLASSIFICATION_DUMP_COLLECTION } from "../services/classification.rest_dump";
+import { persistRestItemFulfillmentRows, NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION } from "../services/item_fulfillment.rest_dump";
+import { persistRestItemReceiptRows, NS_REST_ITEM_RECEIPT_DUMP_COLLECTION } from "../services/item_receipt.rest_dump";
+import type { BaselineCompareVariant } from "../config/ns_baseline_compare.config";
+import { runNsRestCompareBaselineBatch, runNsRestCompareBatch, parseCompareFlag } from "../services/ns_rest_compare.service";
 
 const router = Router();
 
@@ -100,6 +103,7 @@ type RestRecordRouteConfig = {
         expandSubResources?: string;
         maxRecords?: number;
         pageSize?: number;
+        untilExhausted?: boolean;
     }) => Promise<any[]>;
     hydrateFromListRows: (listItems: any[], expandSubResources?: string) => Promise<any[]>;
     extractIdFromListItem: (item: any) => string | null;
@@ -108,7 +112,34 @@ type RestRecordRouteConfig = {
     fetchAllAbsMax: number;
     listDefaultLimit: number;
     listAbsMax: number;
+    /** Key in `NS_REST_COMPARE_FIELD_PATHS` (used when comparing against REST dump only) */
+    recordTypeKey: string;
+    dumpCollection: string;
+    /** When set, `compare=true` diffs against this operational collection instead of the dump `payload`. */
+    compareBaselineVariant?: BaselineCompareVariant;
 };
+
+async function runRestRecordCompare(
+    cfg: RestRecordRouteConfig,
+    items: any[],
+    source: Record<string, unknown>
+) {
+    if (cfg.compareBaselineVariant) {
+        return runNsRestCompareBaselineBatch({
+            variant: cfg.compareBaselineVariant,
+            items,
+            extractId: cfg.extractIdFromListItem,
+            source,
+        });
+    }
+    return runNsRestCompareBatch({
+        recordTypeKey: cfg.recordTypeKey,
+        dumpCollection: cfg.dumpCollection,
+        items,
+        extractId: cfg.extractIdFromListItem,
+        source,
+    });
+}
 
 function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
     const listPath = `/${cfg.pathSegment}`;
@@ -119,51 +150,75 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
         const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
         const fetchAll = req.query.fetchAll === "true";
         const persistDb = parsePersistDbFlag(req);
+        const compare = parseCompareFlag(req);
 
         try {
             if (fetchAll) {
+                const untilExhausted = req.query.untilExhausted === "true";
                 const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
-                const maxRecords = Number.isFinite(rawMax)
-                    ? Math.min(Math.max(1, rawMax), cfg.fetchAllAbsMax)
-                    : cfg.fetchAllDefaultMax;
+                const maxRecords = untilExhausted
+                    ? nsRestFetchUntilExhaustedCap()
+                    : Number.isFinite(rawMax)
+                      ? Math.min(Math.max(1, rawMax), cfg.fetchAllAbsMax)
+                      : cfg.fetchAllDefaultMax;
 
                 const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
                 const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1_000) : undefined;
 
                 log.info(
                     `[${cfg.logLabel} List] fetchAll — maxRecords=${maxRecords}` +
+                        (untilExhausted ? ", untilExhausted=true" : "") +
                         (pageSize != null ? `, pageSize=${pageSize}` : "")
                 );
 
                 const allRecords = await cfg.fetchAllFn({
                     q: req.query.q,
                     expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
-                    maxRecords,
+                    maxRecords: untilExhausted ? undefined : maxRecords,
                     pageSize,
+                    untilExhausted,
                 });
                 const persistResult = await cfg.persistItems(allRecords, {
                     save: persistDb,
                     queryContext: {
                         mode: "fetchAll",
                         maxRecords,
+                        untilExhausted,
                         pageSize: pageSize ?? null,
                         q: req.query.q ?? null,
                         dbPayloadSource: "per_id_get",
                     },
                 });
+                const compareResult = compare
+                    ? await runRestRecordCompare(cfg, allRecords, {
+                          api: cfg.pathSegment,
+                          mode: "fetchAll",
+                          untilExhausted,
+                          maxRecords,
+                          pageSize: pageSize ?? null,
+                      })
+                    : null;
                 return res.json({
                     success: true,
                     fetchAll: true,
+                    untilExhausted,
                     maxRecords,
                     pageSize: pageSize ?? null,
                     count: allRecords.length,
                     items: allRecords,
                     persistDb,
                     persist: enrichPersistResult(persistResult, persistDb, allRecords.length),
-                    limits: {
-                        defaultMax: cfg.fetchAllDefaultMax,
-                        absMax: cfg.fetchAllAbsMax,
-                    },
+                    compare,
+                    compareResult,
+                    limits: untilExhausted
+                        ? {
+                              untilExhaustedCap: nsRestFetchUntilExhaustedCap(),
+                              note: "Pages until NetSuite ends the list or cap is hit (env NS_REST_FETCH_UNTIL_EXHAUSTED_CAP).",
+                          }
+                        : {
+                              defaultMax: cfg.fetchAllDefaultMax,
+                              absMax: cfg.fetchAllAbsMax,
+                          },
                 });
             }
 
@@ -193,9 +248,9 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                 if (!wantDetails) {
                     const listOnly = normalizeRestRecordListItems(data);
                     let rowsForPersist = listOnly;
-                    if (persistDb && listOnly.length > 0) {
+                    if ((persistDb || compare) && listOnly.length > 0) {
                         log.info(
-                            `[${cfg.logLabel} List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                            `[${cfg.logLabel} List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`
                         );
                         rowsForPersist = await cfg.hydrateFromListRows(listOnly, expandOnDetail);
                     }
@@ -209,6 +264,14 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                             dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                         },
                     });
+                    const compareResult = compare
+                        ? await runRestRecordCompare(cfg, rowsForPersist, {
+                              api: cfg.pathSegment,
+                              mode: "list_only_async",
+                              limit: listLimit,
+                              offset: listOffset,
+                          })
+                        : null;
                     return res.status(202).setHeader("Preference-Applied", "respond-async").json({
                         success: true,
                         async: true,
@@ -219,6 +282,8 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                         offset: listOffset,
                         persistDb,
                         persist: enrichPersistResult(persistResult, persistDb, rowsForPersist.length),
+                        compare,
+                        compareResult,
                     });
                 }
                 const listItems = normalizeRestRecordListItems(data);
@@ -238,6 +303,14 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                         dbPayloadSource: "per_id_get",
                     },
                 });
+                const compareResult = compare
+                    ? await runRestRecordCompare(cfg, items, {
+                          api: cfg.pathSegment,
+                          mode: "list_details_async",
+                          limit: listLimit,
+                          offset: listOffset,
+                      })
+                    : null;
                 const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
                 const recordDetailBase = accountHost
                     ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/${cfg.pathSegment}`
@@ -256,6 +329,8 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     recordDetailBase,
                     persistDb,
                     persist: enrichPersistResult(persistResult, persistDb, items.length),
+                    compare,
+                    compareResult,
                     items,
                 });
             }
@@ -265,9 +340,9 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
             if (!wantDetails) {
                 const listOnly = normalizeRestRecordListItems(data);
                 let rowsForPersist = listOnly;
-                if (persistDb && listOnly.length > 0) {
+                if ((persistDb || compare) && listOnly.length > 0) {
                     log.info(
-                        `[${cfg.logLabel} List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                        `[${cfg.logLabel} List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`
                     );
                     rowsForPersist = await cfg.hydrateFromListRows(listOnly, expandOnDetail);
                 }
@@ -281,6 +356,14 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                         dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                     },
                 });
+                const compareResult = compare
+                    ? await runRestRecordCompare(cfg, rowsForPersist, {
+                          api: cfg.pathSegment,
+                          mode: "list_only",
+                          limit: listLimit,
+                          offset: listOffset,
+                      })
+                    : null;
                 return res.json({
                     success: true,
                     details: false,
@@ -289,6 +372,8 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     offset: listOffset,
                     persistDb,
                     persist: enrichPersistResult(persistResult, persistDb, rowsForPersist.length),
+                    compare,
+                    compareResult,
                 });
             }
 
@@ -309,6 +394,14 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     dbPayloadSource: "per_id_get",
                 },
             });
+            const compareResult = compare
+                ? await runRestRecordCompare(cfg, items, {
+                      api: cfg.pathSegment,
+                      mode: "list_details",
+                      limit: listLimit,
+                      offset: listOffset,
+                  })
+                : null;
             const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
             const recordDetailBase = accountHost
                 ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/${cfg.pathSegment}`
@@ -326,6 +419,8 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                 recordDetailBase,
                 persistDb,
                 persist: enrichPersistResult(persistResult, persistDb, items.length),
+                compare,
+                compareResult,
                 items,
             });
         } catch (e: any) {
@@ -338,9 +433,17 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
         const { id } = req.params;
         const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
         const persistDb = parsePersistDbFlag(req);
+        const compare = parseCompareFlag(req);
 
         try {
             const data = await cfg.getFn(id, expandSubResources);
+            const compareResult = compare
+                ? await runRestRecordCompare(cfg, [data], {
+                      api: cfg.pathSegment,
+                      mode: "single_record_get",
+                      id: String(id),
+                  })
+                : null;
             if (persistDb) {
                 const persistResult = await cfg.persistItems([data], {
                     save: true,
@@ -355,9 +458,11 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     data,
                     persistDb,
                     persist: enrichPersistResult(persistResult, persistDb, 1),
+                    compare,
+                    compareResult,
                 });
             }
-            res.json({ success: true, data });
+            res.json({ success: true, data, compare, compareResult });
         } catch (e: any) {
             log.error(`[${cfg.logLabel} Get] ${id} Error:`, e.message);
             res.status(500).json({ success: false, error: e.message });
@@ -378,6 +483,9 @@ registerRestRecordRoutes({
     fetchAllAbsMax: INVENTORY_ITEM_FETCH_ALL_ABS_MAX,
     listDefaultLimit: INVENTORY_ITEM_LIST_DEFAULT_LIMIT,
     listAbsMax: INVENTORY_ITEM_LIST_ABS_MAX,
+    recordTypeKey: "inventory_item",
+    dumpCollection: NS_REST_INVENTORY_ITEM_DUMP_COLLECTION,
+    compareBaselineVariant: "inventory_item_full",
 });
 
 registerRestRecordRoutes({
@@ -393,6 +501,9 @@ registerRestRecordRoutes({
     fetchAllAbsMax: CLASSIFICATION_FETCH_ALL_ABS_MAX,
     listDefaultLimit: CLASSIFICATION_LIST_DEFAULT_LIMIT,
     listAbsMax: CLASSIFICATION_LIST_ABS_MAX,
+    recordTypeKey: "classification",
+    dumpCollection: NS_REST_CLASSIFICATION_DUMP_COLLECTION,
+    compareBaselineVariant: "classification_tree",
 });
 
 registerRestRecordRoutes({
@@ -408,6 +519,8 @@ registerRestRecordRoutes({
     fetchAllAbsMax: ITEM_FULFILLMENT_FETCH_ALL_ABS_MAX,
     listDefaultLimit: ITEM_FULFILLMENT_LIST_DEFAULT_LIMIT,
     listAbsMax: ITEM_FULFILLMENT_LIST_ABS_MAX,
+    recordTypeKey: "item_fulfillment",
+    dumpCollection: NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION,
 });
 
 registerRestRecordRoutes({
@@ -423,6 +536,8 @@ registerRestRecordRoutes({
     fetchAllAbsMax: ITEM_RECEIPT_FETCH_ALL_ABS_MAX,
     listDefaultLimit: ITEM_RECEIPT_LIST_DEFAULT_LIMIT,
     listAbsMax: ITEM_RECEIPT_LIST_ABS_MAX,
+    recordTypeKey: "item_receipt",
+    dumpCollection: NS_REST_ITEM_RECEIPT_DUMP_COLLECTION,
 });
 
 export default router;

@@ -10,7 +10,12 @@ import {
     retryFailedSalesOrders,
 } from "../services/sales_order.sync";
 import { migrateSalesOrderSchema, migrateMultiVendorSchema } from "../services/sales_order.migrate";
-import { persistRestSalesOrderItems } from "../services/sales_order.rest_dump";
+import { persistRestSalesOrderItems, NS_REST_SO_DUMP_COLLECTION } from "../services/sales_order.rest_dump";
+import {
+    runNsRestCompareBaselineBatch,
+    parseCompareOrderSource,
+    shouldRunBaselineCompareWithPersist,
+} from "../services/ns_rest_compare.service";
 import { postToNetsuite } from "../services/netsuite.client";
 import {
     listSalesOrders,
@@ -20,6 +25,7 @@ import {
     extractSalesOrderIdFromListItem,
     normalizeSalesOrderListItems,
     restListWantDetails,
+    nsRestFetchUntilExhaustedCap,
     SALES_ORDER_FETCH_ALL_DEFAULT_MAX,
     SALES_ORDER_FETCH_ALL_ABS_MAX,
     SALES_ORDER_LIST_DEFAULT_LIMIT,
@@ -353,6 +359,7 @@ const RETRIABLE_ERROR_PATTERNS = [
     "Channels/Lead Source",
     "valid line item",
     "VALID_LINE_ITEM_REQD",
+    "RCRD_HAS_BEEN_CHANGED",
     "USER_ERROR",
 ];
 router.get("/reset-errored-so", async (_req: any, res: any) => {
@@ -460,62 +467,94 @@ router.post("/restage-walmart", async (_req: any, res: any) => {
  *   expandItems: boolean — passed to each per-id GET when details=true
  *   details: boolean (default true) — after list, GET /record/v1/salesOrder/{id} for each row; false = raw list only
  *   fetchAll: boolean — paged list + detail GETs per order (not unbounded)
- *   maxRecords: with fetchAll, max sales orders (default SALES_ORDER_FETCH_ALL_DEFAULT_MAX, cap SALES_ORDER_FETCH_ALL_ABS_MAX)
+ *   untilExhausted: with fetchAll, true — page until NetSuite ends (cap NS_REST_FETCH_UNTIL_EXHAUSTED_CAP)
+ *   maxRecords: with fetchAll (ignored when untilExhausted), default/cap as above
  *   pageSize: with fetchAll, list page size per NetSuite request (1–1000, optional)
  *   persistDb | saveToDb: true — upsert into Mongo `ns_rest_sales_order_detail_dump` (netsuite DB).
  *     Always persists the full per-id GET payload (even when details=false on the HTTP response).
+ *   compare: true — diff vs `suite_sales_order`; with persistDb=true compare runs by default (opt out: compare=false).
  */
 router.get("/salesOrder", async (req: any, res: any) => {
     const prefer = req.headers.prefer;
     const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
     const fetchAll = req.query.fetchAll === "true";
     const persistDb = parsePersistDbFlag(req);
+    const compare = shouldRunBaselineCompareWithPersist(req, persistDb);
 
     try {
         // fetchAll: capped batch of full records (parallel detail fetches, shared NS concurrency)
         if (fetchAll) {
+            const untilExhausted = req.query.untilExhausted === "true";
             const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
-            const maxRecords = Number.isFinite(rawMax)
-                ? Math.min(Math.max(1, rawMax), SALES_ORDER_FETCH_ALL_ABS_MAX)
-                : SALES_ORDER_FETCH_ALL_DEFAULT_MAX;
+            const maxRecords = untilExhausted
+                ? nsRestFetchUntilExhaustedCap()
+                : Number.isFinite(rawMax)
+                  ? Math.min(Math.max(1, rawMax), SALES_ORDER_FETCH_ALL_ABS_MAX)
+                  : SALES_ORDER_FETCH_ALL_DEFAULT_MAX;
 
             const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
             const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1_000) : undefined;
 
             log.info(
                 `[SalesOrder List] fetchAll — maxRecords=${maxRecords}` +
+                    (untilExhausted ? ", untilExhausted=true" : "") +
                     (pageSize != null ? `, pageSize=${pageSize}` : "")
             );
 
             const allRecords = await fetchAllSalesOrders({
                 q: req.query.q,
                 expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
-                maxRecords,
+                maxRecords: untilExhausted ? undefined : maxRecords,
                 pageSize,
+                untilExhausted,
             });
             const persistResult = await persistRestSalesOrderItems(allRecords, {
                 save: persistDb,
                 queryContext: {
                     mode: "fetchAll",
                     maxRecords,
+                    untilExhausted,
                     pageSize: pageSize ?? null,
                     q: req.query.q ?? null,
                     dbPayloadSource: "per_id_get",
                 },
             });
+            const compareResult = compare
+                ? await runNsRestCompareBaselineBatch({
+                      variant: "sales_order_staged",
+                      items: allRecords,
+                      extractId: extractSalesOrderIdFromListItem,
+                      orderSource: parseCompareOrderSource(req),
+                      source: {
+                          api: "salesOrder",
+                          mode: "fetchAll",
+                          untilExhausted,
+                          maxRecords,
+                          pageSize: pageSize ?? null,
+                      },
+                  })
+                : null;
             return res.json({
                 success: true,
                 fetchAll: true,
+                untilExhausted,
                 maxRecords,
                 pageSize: pageSize ?? null,
                 count: allRecords.length,
                 items: allRecords,
                 persistDb,
                 persist: persistResult,
-                limits: {
-                    defaultMax: SALES_ORDER_FETCH_ALL_DEFAULT_MAX,
-                    absMax: SALES_ORDER_FETCH_ALL_ABS_MAX,
-                },
+                compare,
+                compareResult,
+                limits: untilExhausted
+                    ? {
+                          untilExhaustedCap: nsRestFetchUntilExhaustedCap(),
+                          note: "Pages until NetSuite ends the list or cap is hit (env NS_REST_FETCH_UNTIL_EXHAUSTED_CAP).",
+                      }
+                    : {
+                          defaultMax: SALES_ORDER_FETCH_ALL_DEFAULT_MAX,
+                          absMax: SALES_ORDER_FETCH_ALL_ABS_MAX,
+                      },
             });
         }
 
@@ -546,9 +585,9 @@ router.get("/salesOrder", async (req: any, res: any) => {
             if (!wantDetails) {
                 const listOnly = normalizeSalesOrderListItems(data);
                 let rowsForPersist = listOnly;
-                if (persistDb && listOnly.length > 0) {
+                if ((persistDb || compare) && listOnly.length > 0) {
                     log.info(
-                        `[SalesOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                        `[SalesOrder List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`
                     );
                     rowsForPersist = await hydrateSalesOrdersFromListRows(listOnly, expandOnDetail);
                 }
@@ -562,6 +601,15 @@ router.get("/salesOrder", async (req: any, res: any) => {
                         dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                     },
                 });
+                const compareResult = compare
+                    ? await runNsRestCompareBaselineBatch({
+                          variant: "sales_order_staged",
+                          items: rowsForPersist,
+                          extractId: extractSalesOrderIdFromListItem,
+                          orderSource: parseCompareOrderSource(req),
+                          source: { api: "salesOrder", mode: "list_only_async", limit: listLimit, offset: listOffset },
+                      })
+                    : null;
                 return res.status(202).setHeader("Preference-Applied", "respond-async").json({
                     success: true,
                     async: true,
@@ -572,6 +620,8 @@ router.get("/salesOrder", async (req: any, res: any) => {
                     offset: listOffset,
                     persistDb,
                     persist: persistResult,
+                    compare,
+                    compareResult,
                 });
             }
             const listItems = normalizeSalesOrderListItems(data);
@@ -591,6 +641,15 @@ router.get("/salesOrder", async (req: any, res: any) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
+            const compareResult = compare
+                ? await runNsRestCompareBaselineBatch({
+                      variant: "sales_order_staged",
+                      items,
+                      extractId: extractSalesOrderIdFromListItem,
+                      orderSource: parseCompareOrderSource(req),
+                      source: { api: "salesOrder", mode: "list_details_async", limit: listLimit, offset: listOffset },
+                  })
+                : null;
             const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
             const recordDetailBase = accountHost
                 ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/salesOrder`
@@ -609,6 +668,8 @@ router.get("/salesOrder", async (req: any, res: any) => {
                 recordDetailBase,
                 persistDb,
                 persist: persistResult,
+                compare,
+                compareResult,
                 items,
             });
         }
@@ -618,9 +679,9 @@ router.get("/salesOrder", async (req: any, res: any) => {
         if (!wantDetails) {
             const listOnly = normalizeSalesOrderListItems(data);
             let rowsForPersist = listOnly;
-            if (persistDb && listOnly.length > 0) {
+            if ((persistDb || compare) && listOnly.length > 0) {
                 log.info(
-                    `[SalesOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`
+                    `[SalesOrder List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`
                 );
                 rowsForPersist = await hydrateSalesOrdersFromListRows(listOnly, expandOnDetail);
             }
@@ -634,6 +695,15 @@ router.get("/salesOrder", async (req: any, res: any) => {
                     dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                 },
             });
+            const compareResult = compare
+                ? await runNsRestCompareBaselineBatch({
+                      variant: "sales_order_staged",
+                      items: rowsForPersist,
+                      extractId: extractSalesOrderIdFromListItem,
+                      orderSource: parseCompareOrderSource(req),
+                      source: { api: "salesOrder", mode: "list_only", limit: listLimit, offset: listOffset },
+                  })
+                : null;
             return res.json({
                 success: true,
                 details: false,
@@ -642,6 +712,8 @@ router.get("/salesOrder", async (req: any, res: any) => {
                 offset: listOffset,
                 persistDb,
                 persist: persistResult,
+                compare,
+                compareResult,
             });
         }
 
@@ -662,6 +734,15 @@ router.get("/salesOrder", async (req: any, res: any) => {
                 dbPayloadSource: "per_id_get",
             },
         });
+        const compareResult = compare
+            ? await runNsRestCompareBaselineBatch({
+                  variant: "sales_order_staged",
+                  items,
+                  extractId: extractSalesOrderIdFromListItem,
+                  orderSource: parseCompareOrderSource(req),
+                  source: { api: "salesOrder", mode: "list_details", limit: listLimit, offset: listOffset },
+              })
+            : null;
         const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
         const recordDetailBase = accountHost
             ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/salesOrder`
@@ -679,6 +760,8 @@ router.get("/salesOrder", async (req: any, res: any) => {
             recordDetailBase,
             persistDb,
             persist: persistResult,
+            compare,
+            compareResult,
             items,
         });
     } catch (e: any) {
@@ -691,14 +774,25 @@ router.get("/salesOrder", async (req: any, res: any) => {
  * GET /salesOrder/:id
  * Get single Sales Order by ID
  * Query: persistDb | saveToDb — upsert this record into `ns_rest_sales_order_detail_dump`
+ *         compare — baseline diff (with persistDb=true runs by default unless compare=false); compareOrderSource for otherrefnum
  */
 router.get("/salesOrder/:id", async (req: any, res: any) => {
     const { id } = req.params;
     const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
     const persistDb = parsePersistDbFlag(req);
+    const compare = shouldRunBaselineCompareWithPersist(req, persistDb);
 
     try {
         const data = await getSalesOrder(id, expandSubResources);
+        const compareResult = compare
+            ? await runNsRestCompareBaselineBatch({
+                  variant: "sales_order_staged",
+                  items: [data],
+                  extractId: extractSalesOrderIdFromListItem,
+                  orderSource: parseCompareOrderSource(req),
+                  source: { api: "salesOrder", mode: "single_record_get", id: String(id) },
+              })
+            : null;
         if (persistDb) {
             const persistResult = await persistRestSalesOrderItems([data], {
                 save: true,
@@ -708,9 +802,9 @@ router.get("/salesOrder/:id", async (req: any, res: any) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
-            return res.json({ success: true, data, persistDb, persist: persistResult });
+            return res.json({ success: true, data, persistDb, persist: persistResult, compare, compareResult });
         }
-        res.json({ success: true, data });
+        res.json({ success: true, data, compare, compareResult });
     } catch (e: any) {
         log.error(`[SalesOrder Get] ${id} Error:`, e.message);
         res.status(500).json({ success: false, error: e.message });

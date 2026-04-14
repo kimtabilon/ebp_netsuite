@@ -1,0 +1,387 @@
+
+========== 2026-04-12 17:26:17.804 ==========
+{
+  "message": "new reques"
+}
+
+========== 2026-04-12 17:26:33.623 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:33.321Z",
+  "context": "post_start",
+  "message": "",
+  "scriptLine": 603,
+  "data": {
+    "action": "update",
+    "otherrefnum": "114-4569256-4348216"
+  }
+}
+
+========== 2026-04-12 17:26:34.182 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:34.121Z",
+  "context": "ITEM_MAP_row",
+  "message": "",
+  "scriptLine": 658,
+  "data": {
+    "row": 0,
+    "sku": "006R04400"
+  }
+}
+
+========== 2026-04-12 17:26:34.326 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:34.265Z",
+  "context": "ITEM_MATCH",
+  "message": "",
+  "scriptLine": 671,
+  "data": {
+    "row": 0,
+    "sku": "006R04400",
+    "internalid": 2451,
+    "qty": 1,
+    "amt": 109,
+    "rate": 109
+  }
+}
+
+========== 2026-04-12 17:26:35.764 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:35.705Z",
+  "context": "snapshotSO_line",
+  "message": "",
+  "scriptLine": 470,
+  "data": {
+    "line": 0,
+    "row": {
+      "line": 0,
+      "item": "20567",
+      "quantity": 1,
+      "rate": 198.94,
+      "amount": 198.94,
+      "location": "",
+      "price": "-1",
+      "description": "PIXMA TR160"
+    }
+  }
+}
+
+========== 2026-04-12 17:26:35.888 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:35.824Z",
+  "context": "ebpDescribeItemLines_row",
+  "message": "",
+  "scriptLine": 540,
+  "data": {
+    "line": 0,
+    "row": {
+      "line": 0,
+      "item": "20567",
+      "quantity": 1,
+      "quantityfulfilled": 0,
+      "quantitycommitted": 0,
+      "location": "",
+      "rate": 198.94,
+      "amount": 198.94,
+      "createpo": "",
+      "price": "-1",
+      "item_display": "7069C002 PIXMA TR160"
+    }
+  }
+}
+
+========== 2026-04-12 17:26:37.074 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.014Z",
+  "context": "LINE_REMOVED",
+  "message": "",
+  "scriptLine": 845,
+  "data": {
+    "line": 0
+  }
+}
+
+========== 2026-04-12 17:26:37.193 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.130Z",
+  "context": "LINE_ITEM_start",
+  "message": "",
+  "scriptLine": 858,
+  "data": {
+    "mappedIndex": 0,
+    "sku": "006R04400",
+    "nsItemInternalId": 2451
+  }
+}
+
+========== 2026-04-12 17:26:37.308 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.249Z",
+  "context": "LINE_ITEM_existingLine",
+  "message": "",
+  "scriptLine": 865,
+  "data": {
+    "sku": "006R04400",
+    "sublistLine": -1
+  }
+}
+
+========== 2026-04-12 17:26:37.423 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.363Z",
+  "context": "LINE_NEW",
+  "message": "",
+  "scriptLine": 895,
+  "data": {
+    "sku": "006R04400"
+  }
+}
+
+========== 2026-04-12 17:26:37.571 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.513Z",
+  "context": "LINE_ITEM_set_item",
+  "message": "",
+  "scriptLine": 899,
+  "data": {
+    "sku": "006R04400",
+    "itemInternalId": 2451
+  }
+}
+
+========== 2026-04-12 17:26:37.689 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.630Z",
+  "context": "LINE_ITEM_quantity",
+  "message": "",
+  "scriptLine": 923,
+  "data": {
+    "sku": "006R04400",
+    "quantity": 1
+  }
+}
+
+========== 2026-04-12 17:26:37.807 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.749Z",
+  "context": "LINE_ITEM_rate_amount",
+  "message": "",
+  "scriptLine": 931,
+  "data": {
+    "sku": "006R04400",
+    "rate": 109,
+    "amount": 109,
+    "step": "before_commitLine"
+  }
+}
+
+========== 2026-04-12 17:26:37.930 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.870Z",
+  "context": "LINE_ITEM_commitLine_ok",
+  "message": "",
+  "scriptLine": 933,
+  "data": {
+    "sku": "006R04400"
+  }
+}
+
+========== 2026-04-12 17:26:38.048 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:37.990Z",
+  "context": "ebpDescribeItemLines_row",
+  "message": "",
+  "scriptLine": 540,
+  "data": {
+    "line": 0,
+    "row": {
+      "line": 0,
+      "item": "2451",
+      "quantity": 1,
+      "quantityfulfilled": "",
+      "quantitycommitted": "",
+      "location": "",
+      "rate": 109,
+      "amount": 109,
+      "createpo": "",
+      "price": "-1",
+      "item_display": "006R04400 GENUINE XEROX BLACK HIGH CAPACITY TONER CARTRIDGE, XEROX B230/B225/B235 PRINTER/"
+    }
+  }
+}
+
+========== 2026-04-12 17:26:38.164 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:38.106Z",
+  "context": "ebpDescribeItemLines_row",
+  "message": "",
+  "scriptLine": 540,
+  "data": {
+    "line": 0,
+    "row": {
+      "line": 0,
+      "item": "2451",
+      "quantity": 1,
+      "quantityfulfilled": "",
+      "quantitycommitted": "",
+      "location": "",
+      "rate": 109,
+      "amount": 109,
+      "createpo": "",
+      "price": "-1",
+      "item_display": "006R04400 GENUINE XEROX BLACK HIGH CAPACITY TONER CARTRIDGE, XEROX B230/B225/B235 PRINTER/"
+    }
+  }
+}
+
+========== 2026-04-12 17:26:38.281 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:38.223Z",
+  "context": "snapshotSO_line",
+  "message": "",
+  "scriptLine": 470,
+  "data": {
+    "line": 0,
+    "row": {
+      "line": 0,
+      "item": "2451",
+      "quantity": 1,
+      "rate": 109,
+      "amount": 109,
+      "location": "",
+      "price": "-1",
+      "description": "GENUINE XEROX BLACK HIGH CAPACITY TONER CARTRIDGE, XEROX B230/B225/B235 PRINTER/"
+    }
+  }
+}
+
+========== 2026-04-12 17:26:41.179 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:41.118Z",
+  "context": "EBP_SO_UPSERT_ERR",
+  "message": "",
+  "scriptLine": 988,
+  "data": {
+    "rcrdAttempt": 1,
+    "otherrefnum": "114-4569256-4348216"
+  },
+  "error": {
+    "name": "VALID_LINE_ITEM_REQD",
+    "message": "You must have at least one valid line item for this transaction.",
+    "stack": "Error\n    at RecordInvoker.save (suitescript/resources/javascript/record/serverRecordService.js:384:13)\n    at NetSuiteObject.thenableFunction() (suitescript/resources/javascript/record/proxy.js:115:24)\n    at Object.post (/SuiteScripts/sales_order_restlet.js:974:38)",
+    "lineNumber": 384,
+    "cause": {
+      "name": "Error",
+      "message": "{\"type\":\"internal error\",\"code\":\"VALID_LINE_ITEM_REQD\",\"details\":\"You must have at least one valid line item for this transaction.\",\"userEvent\":null,\"stackTrace\":[\"Error\\n    at RecordInvoker.save (suitescript/resources/javascript/record/serverRecordService.js:384:13)\\n    at NetSuiteObject.thenableFunction() (suitescript/resources/javascript/record/proxy.js:115:24)\\n    at Object.post (/SuiteScripts/sales_order_restlet.js:974:38)\"],\"notifyOff\":false}",
+      "lineNumber": null,
+      "stack": null,
+      "id": "",
+      "code": "VALID_LINE_ITEM_REQD",
+      "details": "You must have at least one valid line item for this transaction.",
+      "userEvent": null
+    },
+    "type": "error.SuiteScriptError",
+    "id": "",
+    "notifyOff": false,
+    "userFacing": true
+  }
+}
+
+========== 2026-04-12 17:26:41.296 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:41.237Z",
+  "context": "ebpDescribeItemLines_row",
+  "message": "",
+  "scriptLine": 540,
+  "data": {
+    "line": 0,
+    "row": {
+      "line": 0,
+      "item": "2451",
+      "quantity": 1,
+      "quantityfulfilled": "",
+      "quantitycommitted": "",
+      "location": "",
+      "rate": 109,
+      "amount": 109,
+      "createpo": "",
+      "price": "-1",
+      "item_display": "006R04400 GENUINE XEROX BLACK HIGH CAPACITY TONER CARTRIDGE, XEROX B230/B225/B235 PRINTER/"
+    }
+  }
+}
+
+========== 2026-04-12 17:26:41.424 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:41.363Z",
+  "context": "FATAL",
+  "message": "",
+  "scriptLine": 1018,
+  "data": {
+    "otherrefnum": "114-4569256-4348216"
+  },
+  "error": {
+    "name": "VALID_LINE_ITEM_REQD",
+    "message": "You must have at least one valid line item for this transaction.",
+    "stack": "Error\n    at RecordInvoker.save (suitescript/resources/javascript/record/serverRecordService.js:384:13)\n    at NetSuiteObject.thenableFunction() (suitescript/resources/javascript/record/proxy.js:115:24)\n    at Object.post (/SuiteScripts/sales_order_restlet.js:974:38)",
+    "lineNumber": 384,
+    "cause": {
+      "name": "Error",
+      "message": "{\"type\":\"internal error\",\"code\":\"VALID_LINE_ITEM_REQD\",\"details\":\"You must have at least one valid line item for this transaction.\",\"userEvent\":null,\"stackTrace\":[\"Error\\n    at RecordInvoker.save (suitescript/resources/javascript/record/serverRecordService.js:384:13)\\n    at NetSuiteObject.thenableFunction() (suitescript/resources/javascript/record/proxy.js:115:24)\\n    at Object.post (/SuiteScripts/sales_order_restlet.js:974:38)\"],\"notifyOff\":false}",
+      "lineNumber": null,
+      "stack": null,
+      "id": "",
+      "code": "VALID_LINE_ITEM_REQD",
+      "details": "You must have at least one valid line item for this transaction.",
+      "userEvent": null
+    },
+    "type": "error.SuiteScriptError",
+    "id": "",
+    "notifyOff": false,
+    "userFacing": true
+  }
+}
+
+========== 2026-04-12 17:26:41.544 ==========
+{
+  "source": "ebp_sales_order_restlet",
+  "timestamp": "2026-04-12T17:26:41.484Z",
+  "context": "ebpDescribeItemLines_row",
+  "message": "",
+  "scriptLine": 540,
+  "data": {
+    "line": 0,
+    "row": {
+      "line": 0,
+      "item": "2451",
+      "quantity": 1,
+      "quantityfulfilled": "",
+      "quantitycommitted": "",
+      "location": "",
+      "rate": 109,
+      "amount": 109,
+      "createpo": "",
+      "price": "-1",
+      "item_display": "006R04400 GENUINE XEROX BLACK HIGH CAPACITY TONER CARTRIDGE, XEROX B230/B225/B235 PRINTER/"
+    }
+  }
+}
+
