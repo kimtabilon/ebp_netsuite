@@ -26,30 +26,36 @@ export const syncBillsToNetsuite = async (): Promise<any[]> => {
     const billCollection = ns_db.collection("suite_vendor_bill");
     const poCollection = ns_db.collection("suite_purchase_order");
 
-    // Base filter: not synced, not failed, not skipped
+
+    // Base filter: not synced, not failed, not skipped, and must have po_number
     const filter = {
         ns_synced: { $ne: true },
         ns_failed: { $ne: true },
-        ns_skip:   { $ne: true }
+        ns_skip:   { $ne: true },
+        po_number: { $exists: true, $ne: null }
     };
 
-    const bills = await billCollection.find(filter).limit(BILL_BATCH).toArray();
+    // Fetch all eligible bills (no batch limit here)
+    const allBills = await billCollection.find(filter).toArray();
 
-    if (bills.length === 0) {
+    if (allBills.length === 0) {
         log.info("[NS Bill Sync] No bills to process. Skipping.");
+        console.log("[NS Bill Sync] No bills to process. Skipping.");
         return [];
     }
 
     // -- PO dependency check: only sync bills whose PO is confirmed created --
-    const poNumbers = Array.from(new Set(bills.map((b: any) => b.po_number)));
+
+    const poNumbers = Array.from(new Set(allBills.map((b: any) => b.po_number)));
     const syncedPOs = await poCollection
         .find({ po_number: { $in: poNumbers }, ns_synced: true, ns_result: "created" })
         .project({ po_number: 1 })
         .toArray();
     const syncedPOSet = new Set(syncedPOs.map((p: any) => p.po_number));
 
-    const readyBills = bills.filter((b: any) => syncedPOSet.has(b.po_number));
-    const waitingBills = bills.length - readyBills.length;
+    // Only process up to BILL_BATCH bills that have synced POs
+    const readyBills = allBills.filter((b: any) => syncedPOSet.has(b.po_number)).slice(0, BILL_BATCH);
+    const waitingBills = allBills.length - readyBills.length;
 
     if (waitingBills > 0) {
         log.info(`[NS Bill Sync] ${waitingBills} bills waiting -- PO not synced yet (will retry next cycle)`);
@@ -60,7 +66,10 @@ export const syncBillsToNetsuite = async (): Promise<any[]> => {
         return [];
     }
 
+
     log.info(`[NS Bill Sync] ${readyBills.length} bills ready (${syncedPOs.length} POs synced)${TEST_MODE ? " (TEST MODE)" : ""}`);
+    log.info(`${readyBills}`);
+ 
 
     if (TEST_MODE || STOP_ON_ERROR) {
         return syncSerial(billCollection, readyBills);
@@ -79,8 +88,10 @@ export const syncBillsToNetsuite = async (): Promise<any[]> => {
             const entry = await syncOneBill(billCollection, readyBills[i]);
             results[i] = entry;
 
-            if (entry.action === "skipped") skipped++;
-            else if (entry.success === false) errors++;
+            if (entry.action === "skipped"){ 
+                skipped++
+                log.warn(`[NS Bill Sync] Bill ${readyBills[i]} skipped: ${entry.error}`);
+            }  else if (entry.success === false) errors++;
             else sent++;
         }
     }
@@ -90,15 +101,29 @@ export const syncBillsToNetsuite = async (): Promise<any[]> => {
     );
 
     log.info(`[NS Bill Sync] Done -- sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${readyBills.length}`);
+    // Console summary for test/debug
+    const failed = results.filter(r => r.success === false);
+    const failedReasons = {};
+    failed.forEach(r => {
+        if (r.error) {
+            failedReasons[r.error] = (failedReasons[r.error] || 0) + 1;
+        }
+    });
+    console.log(`[NS Bill Sync] Summary: sent=${sent}, skipped=${skipped}, errors=${errors}, total=${readyBills.length}`);
+    if (Object.keys(failedReasons).length > 0) {
+        console.log('[NS Bill Sync] Failure reasons:', failedReasons);
+    }
     return results;
 };
 
 // -- Process a single bill: RESTlet call + MongoDB status update --
 async function syncOneBill(collection: any, bill: any): Promise<any> {
+    console.log(`[NS Bill Sync] Processing bill ${bill.reference_number || bill._id} (PO ${bill.po_number})`);
     const t0 = Date.now();
     const ref = bill.reference_number || `PO${bill.po_number}-${bill.invoice_number}`;
 
     try {
+        console.log("Trying the sync one bill -------")
         const result = await withConcurrency(() => postToNetsuiteForBill({
             action:             SYNC_MODE,
             po_number:          bill.po_number,

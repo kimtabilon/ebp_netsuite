@@ -38,6 +38,8 @@ const buildOAuthHeader = (url: string, method: string): string => {
 const RESTLET_TIMEOUT_MS = 30_000; // 30s — prevents hung calls from blocking concurrency slots forever
 
 const post = async (scriptId: string, deployId: string, payload: object): Promise<any> => {
+    console.log("scriptId" , scriptId)
+    console.log("deployId" , deployId)
     const url = buildRestletUrl(scriptId, deployId);
     log.info(`[NS Client] POST → ${url}`);
 

@@ -356,7 +356,7 @@ async function markFailed(collection: any, order: any, error: any) {
 
     if (permanentlyFailed) {
         update.$set.ns_failed = true;
-        log.error(`[NS PO Sync] PO ${order.po_number} exceeded ${MAX_RETRIES} retries — marked as permanently failed.`);
+        log.error(`[NS PO Sync] PO ${order.po_number} no retries — marked as permanently failed.`);
         console.error(`Purchase order sync failed for PO #${order.po_number}:`, error);
     }
 
