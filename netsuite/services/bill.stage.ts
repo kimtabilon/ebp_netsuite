@@ -111,13 +111,27 @@ export const stageBills = async (): Promise<{ processed: number; skipped: number
         doc.ns_skip_reason = reason;
         skippedCount++;
         skipReasons[reason] = (skipReasons[reason] || 0) + 1;
+        // Log details of the skipped bill
+        console.log(`[Bill Stage][SKIP] PO: ${doc.po_number || '-'} | Invoice: ${doc.invoice_number || '-'} | Reason: ${reason}`);
     }
 
     for await (const bill of bills_cursor) {
-        // Must have poNumber and invoiceNumber to form a unique key
-        if (!bill.poNumber) continue;
+        // Only stage if bill has a valid poNumber
+        if (!bill.poNumber) {
+            log.warn(`[Bill Stage] Skipping bill with missing poNumber`);
+            // Log skipped bill
+            console.log(`[Bill Stage][SKIP] PO: - | Invoice: ${bill.invoiceNumber || '-'} | Reason: no_poNumber`);
+            skippedCount++;
+            skipReasons['no_poNumber'] = (skipReasons['no_poNumber'] || 0) + 1;
+            continue;
+        }
+        // Must have invoiceNumber to form a unique key
         if (!bill.invoiceNumber) {
             log.warn(`[Bill Stage] PO ${bill.poNumber} missing invoiceNumber -- skipping source doc`);
+            // Log skipped bill
+            console.log(`[Bill Stage][SKIP] PO: ${bill.poNumber} | Invoice: - | Reason: no_invoiceNumber`);
+            skippedCount++;
+            skipReasons['no_invoiceNumber'] = (skipReasons['no_invoiceNumber'] || 0) + 1;
             continue;
         }
 
@@ -179,12 +193,13 @@ export const stageBills = async (): Promise<{ processed: number; skipped: number
     }
 
     log.info(`[Bill Stage] Found ${staged.length} bills (${skippedCount} marked skip: ${JSON.stringify(skipReasons)})`);
+    console.log(`[Bill Stage] Found ${staged.length} bills staged, ${skippedCount} skipped. Skip reasons:`, skipReasons);
 
     if (staged.length > 0) {
         // Upsert by composite key: po_number + invoice_number
         // Use $set for data fields only -- never overwrite ns_ sync tracking fields
         // on docs that are already synced or in-progress.
-        await collection.bulkWrite(
+     const result=    await collection.bulkWrite(
             staged.map(bill => {
                 // Separate data fields from skip flags
                 const { ns_skip, ns_skip_reason, ...dataFields } = bill;
@@ -216,6 +231,10 @@ export const stageBills = async (): Promise<{ processed: number; skipped: number
                 };
             })
         );
+        
+   log.info(`Checking bills that get stagged to netsuite.suite_vendor_bill`);
+ 
+        console.log(result)
     }
 
     log.info(`[Bill Stage] Staged ${staged.length} bills to netsuite.suite_vendor_bill`);
