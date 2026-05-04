@@ -245,7 +245,7 @@ async function runSOSync() {
     }
 }
 
-cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
+// cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
 
 // ─── Every 20 min — Purchase Orders (staging + sync) ──────────────────────
 // PO at :07, :27, :47 — 7-min offset from SO to avoid API overlap.
@@ -253,24 +253,24 @@ cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
 // Batches: 50 stocking + 20 dropship per cron run, 5 parallel workers
 let poSyncRunning = false;
 
-cron.schedule("7,27,47 * * * *", async () => {
-    if (poSyncRunning) {
-        log.warn("[CRON] [PO] Skipping — previous sync still running");
-        return;
-    }
-    poSyncRunning = true;
-    try {
-        log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
-        await withTimeout(() => stagePurchaseOrders(), "PO-Stage");
+// cron.schedule("7,27,47 * * * *", async () => {
+//     if (poSyncRunning) {
+//         log.warn("[CRON] [PO] Skipping — previous sync still running");
+//         return;
+//     }
+//     poSyncRunning = true;
+//     try {
+//         log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
+//         await withTimeout(() => stagePurchaseOrders(), "PO-Stage");
 
-        log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-        await withTimeout(() => syncPurchaseOrdersToNetsuite(), "PO-Sync");
-    } catch (err: any) {
-        log.error("[CRON] [PO] Error", { error: err.message });
-    } finally {
-        poSyncRunning = false;
-    }
-});
+//         log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
+//         await withTimeout(() => syncPurchaseOrdersToNetsuite(), "PO-Sync");
+//     } catch (err: any) {
+//         log.error("[CRON] [PO] Error", { error: err.message });
+//     } finally {
+//         poSyncRunning = false;
+//     }
+// });
 
 // ─── Every 20 min — Bill sync offset from PO ─────────────────────────────
 // SO at :00/:30 → PO at :07/:27/:47 → Bill at :14/:34/:54
