@@ -1,25 +1,30 @@
-name: Deploy to DigitalOcean
+name: Deploy ebp_netsuite to Production
 
 on:
   push:
     branches: [ main ]
+  pull_request:
+    types: [ closed ]
+    branches: [ main ]
 
 jobs:
   deploy:
+    if: github.event_name == 'push' || (github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
 
     steps:
       - name: Deploy to server
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: 2222 
+          port: 22
           script: |
-            cd ~/ebpconsole/ebp_netsuite
-            git stash
-            git pull origin
-            # git reset --hard origin/main
-            npm install
-            pm2 reload vg_netsuite
+            export PATH="/root/.nvm/versions/node/v22.22.0/bin:$PATH"
+            cd ${{ vars.PROJECT_PATH }}
+            git fetch origin
+            git reset --hard origin/main
+            npm ci --production
+            pm2 reload ${{ vars.PM2_APP_NAME }} || pm2 restart ${{ vars.PM2_APP_NAME }}
+            pm2 save
