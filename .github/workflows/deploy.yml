@@ -18,13 +18,30 @@ jobs:
         with:
           host: ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          key: ${{ secrets.SERVER_PRIVATE_KEY }}
           port: 2222
           script: |
             export PATH="/root/.nvm/versions/node/v22.22.0/bin:$PATH"
             cd ${{ vars.PROJECT_PATH }}
+            
+            # Backup .env before any git operations
+            if [ -f .env ]; then
+              cp .env /tmp/.env.backup
+            fi
+            
+            # Update code from main
             git fetch origin
             git reset --hard origin/main
+            
+            # Restore .env if it was backed up
+            if [ -f /tmp/.env.backup ]; then
+              cp /tmp/.env.backup .env
+              rm /tmp/.env.backup
+            fi
+            
+            # Install dependencies
             npm ci
-            pm2 reload ${{ vars.PM2_APP_NAME }} || pm2 restart ${{ vars.PM2_APP_NAME }}
+            
+            # Restart app (only if process exists in PM2)
+            pm2 describe ${{ vars.PM2_APP_NAME }} > /dev/null 2>&1 && pm2 reload ${{ vars.PM2_APP_NAME }} || echo "Process not running, skipping restart"
             pm2 save
