@@ -162,52 +162,40 @@ function withTimeout<T>(fn: () => Promise<T>, label: string, ms = CRON_TIMEOUT_M
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// CRON JOBS
+// CRON JOBS & MANUAL TRIGGERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// 1. W2G dummp cron jobs 
-// Job 1: Runs every 2 hours
-cron.schedule('0 */2 * * *', async () => {
+export const runW2gEvery2Hours = async () => {
     try {
         await getWare2SoOrderOutbound();
     } catch (error: any) {
         log.info(' W2g SO Outbound cron failed : ', error)
-
     }
     try {
         await syncAllWare2GoInboundShipments();
     } catch (error: any) {
         log.info(' W2g Inbound Shipment cron failed : ', error)
-
     }
     log.info('Every 2 hours job executed at: ' + new Date().toISOString());
-});
+};
 
-// // Job 2: Runs every Saturday at 00:00 (midnight)
-cron.schedule('0 0 * * 6', async () => {
-
+export const runW2gWeekly = async () => {
     try {
         await getWare2SoOrderOutbound({ forceRestart: false, retryFailedOnly: false, all: true });
     } catch (error: any) {
-        log.info('Weekly W2g SO Outbound cron cron failed : ', error)
-
+        log.info('Weekly W2g SO Outbound cron failed : ', error)
     }
     try {
         await syncAllWare2GoInboundShipments({ forceRestart: false, retryFailedOnly: false, all: true });
     } catch (error: any) {
         log.info('Weekly W2g Inbound Shipment cron failed : ', error)
-
     }
     log.info('Weekly Saturday job executed at: ' + new Date().toISOString());
-});
+};
 
-
-
-// Define a flag outside the cron job
 let isSyncJobRunning = false;
 
-cron.schedule('*/30 * * * *', async () => {
-
+export const runMainSyncJob = async () => {
     if (isSyncJobRunning) {
         log.info('Previous sync job is still running. Skipping this cron run.');
         return;
@@ -215,7 +203,6 @@ cron.schedule('*/30 * * * *', async () => {
 
     isSyncJobRunning = true;
     log.info('Starting scheduled sync job...');
-
 
     try {
         try {
@@ -225,7 +212,6 @@ cron.schedule('*/30 * * * *', async () => {
             console.log(error)
         }
         try {
-
             await syncDummySalesOrdersToNetsuite();
             console.log("SO sync run")
         } catch (error) {
@@ -250,21 +236,51 @@ cron.schedule('*/30 * * * *', async () => {
             console.log(error)
         }
         try {
-
             await syncStagedDummyBillsOnce();
             console.log("Bill Sync run")
         } catch (error) {
             console.log(error)
         }
-
-
-
-
     } catch (error: any) {
         log.error('Sync cron job failed: ', error);
     } finally {
         isSyncJobRunning = false;
         log.info('Scheduled sync job finished.');
+    }
+};
+
+// 1. W2G dummp cron jobs 
+// Job 1: Runs every 2 hours
+cron.schedule('0 */2 * * *', runW2gEvery2Hours);
+
+// Job 2: Runs every Saturday at 00:00 (midnight)
+cron.schedule('0 0 * * 6', runW2gWeekly);
+
+// Job 3: Every 30 mins
+cron.schedule('*/30 * * * *', runMainSyncJob);
+
+// 4. MANUAL TRIGGER ENDPOINT
+// GET /api/v4/force-run-crons
+app.get("/api/v4/force-run-crons", (req, res) => {
+    const target = req.query.target as string;
+    
+    if (target === "w2g-2h") {
+        runW2gEvery2Hours();
+        res.json({ message: "W2G 2-hour job started in the background." });
+    } else if (target === "w2g-weekly") {
+        runW2gWeekly();
+        res.json({ message: "W2G Weekly job started in the background." });
+    } else if (target === "main-sync") {
+        runMainSyncJob();
+        res.json({ message: "Main Sync job started in the background." });
+    } else {
+        // Run all
+        runW2gEvery2Hours();
+        runMainSyncJob();
+        res.json({ 
+            message: "All primary cron jobs (W2G & Main Sync) started in the background.",
+            hint: "You can trigger specific ones by adding ?target=w2g-2h, ?target=w2g-weekly, or ?target=main-sync to the URL."
+        });
     }
 });
 
