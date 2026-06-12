@@ -10,7 +10,7 @@ import { runFunctionForBills, stageBills, stageCreditBillsDummy } from "./servic
 import { syncBillsToNetsuite, retryFailedBills, syncStagedDummyBillsOnce, } from "./services/bill.sync";
 import { runItemFullSync } from "./controller/netsuite_item_full";
 import { drainQueue } from "./config/concurrency.config";
- 
+
 // Route modules
 import soRoutes from "./route/so.route";
 import poRoutes from "./route/po.route";
@@ -24,11 +24,8 @@ import itemFulfillmentRoutes from "./route/item_fulfillment.route";
 import { stageSalesOrders, } from "./services/sales_order.stage";
 import { NS_REST_COMPARE_LOG_COLLECTION } from "./config/ns_rest_compare.fields";
 import { createMongoWatcher } from "./services/mongo_watcher.service";
-import { deletesyncBills, syncCreditMemosToNetsuite } from "./services/credit_memo.sync";
-import { checkSoItemDuplication, checkSoItemDuplication2, findZeroTotalSalesOrders } from "./services/testfuntions/sotesting";
-import { logAndStripPoTranids, logPOsWithZeroTranid, analyzeUnlinkedPOs } from "./services/testfuntions/potesting";
-import { stageItemFulfillmentsDummy } from "./services/item_fulfillment.stage";
-import { syncItemFulfillmentsToNetsuite } from "./services/item_fulfillment.sync";
+
+
 import { getWare2SoOrderOutbound } from "./services/warehouse.w2g"
 import { syncAllWare2GoInboundShipments } from "./services/inbound.w2g"
 dotenv.config();
