@@ -18,7 +18,7 @@ jobs:
         with:
           host: ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_PRIVATE_KEY }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 2222
           script: |
             export PATH="/root/.nvm/versions/node/v22.22.0/bin:$PATH"
@@ -28,6 +28,12 @@ jobs:
             if [ -f .env ]; then
               cp .env /tmp/.env.backup
             fi
+            
+            # Stash any local changes (including dist/ files)
+            git stash push -m "deploy-stash-$(date +%s)" || true
+            
+            # Clean untracked files (dist/ build outputs)
+            git clean -fd || true
             
             # Update code from main
             git fetch origin
