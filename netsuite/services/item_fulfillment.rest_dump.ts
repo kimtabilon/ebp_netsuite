@@ -3,10 +3,12 @@ import log from "../config/logger.config";
 import { extractItemFulfillmentIdFromListItem } from "./netsuite.rest.client";
 
 export const NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION = "ns_rest_item_fulfillment_detail_dump";
+export const NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION_DUMMY = "ns_rest_item_fulfillment_detail_dump_dummy";
 
 export type PersistRestItemFulfillmentRowsOptions = {
     save: boolean;
     queryContext?: Record<string, unknown>;
+    collection?: string;
 };
 
 export type PersistRestItemFulfillmentRowsResult = {
@@ -31,9 +33,10 @@ export async function persistRestItemFulfillmentRows(
     items: any[],
     options: PersistRestItemFulfillmentRowsOptions
 ): Promise<PersistRestItemFulfillmentRowsResult> {
+    const targetCollection = options.collection || NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION;
     const base: PersistRestItemFulfillmentRowsResult = {
         saved: false,
-        collection: NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION,
+        collection: targetCollection,
         upserted: 0,
         skipped: 0,
         errors: 0,
@@ -49,7 +52,7 @@ export async function persistRestItemFulfillmentRows(
     }
 
     const ns_db = await getDb("netsuite");
-    const col = ns_db.collection(NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION);
+    const col = ns_db.collection(targetCollection);
     const now = new Date();
 
     for (const item of items) {
@@ -71,13 +74,14 @@ export async function persistRestItemFulfillmentRows(
             base.upserted++;
         } catch (err: any) {
             base.errors++;
-            log.error(`[NS REST item fulfillment dump] upsert failed for ${nsId}:`, err?.message || err);
+            const errMsg = err?.message || (typeof err === 'object' ? JSON.stringify(err) : String(err));
+            log.error(`[NS REST item fulfillment dump] upsert failed for ${nsId}: ${errMsg}`);
         }
     }
 
     base.saved = true;
     log.info(
-        `[NS REST item fulfillment dump] collection=${NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
+        `[NS REST item fulfillment dump] collection=${targetCollection} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
     );
     return base;
 }

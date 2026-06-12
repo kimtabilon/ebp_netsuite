@@ -3,10 +3,12 @@ import log from "../config/logger.config";
 import { extractInventoryItemIdFromListItem } from "./netsuite.rest.client";
 
 export const NS_REST_INVENTORY_ITEM_DUMP_COLLECTION = "ns_rest_inventory_item_detail_dump";
+export const NS_REST_INVENTORY_ITEM_DUMP_COLLECTION_DUMMY = "ns_rest_inventory_item_detail_dump_dummy";
 
 export type PersistRestInventoryItemRowsOptions = {
     save: boolean;
     queryContext?: Record<string, unknown>;
+    collection?: string;
 };
 
 export type PersistRestInventoryItemRowsResult = {
@@ -31,9 +33,10 @@ export async function persistRestInventoryItemRows(
     items: any[],
     options: PersistRestInventoryItemRowsOptions
 ): Promise<PersistRestInventoryItemRowsResult> {
+    const targetCollection = options.collection || NS_REST_INVENTORY_ITEM_DUMP_COLLECTION;
     const base: PersistRestInventoryItemRowsResult = {
         saved: false,
-        collection: NS_REST_INVENTORY_ITEM_DUMP_COLLECTION,
+        collection: targetCollection,
         upserted: 0,
         skipped: 0,
         errors: 0,
@@ -49,7 +52,7 @@ export async function persistRestInventoryItemRows(
     }
 
     const ns_db = await getDb("netsuite");
-    const col = ns_db.collection(NS_REST_INVENTORY_ITEM_DUMP_COLLECTION);
+    const col = ns_db.collection(targetCollection);
     const now = new Date();
 
     for (const item of items) {
@@ -84,7 +87,7 @@ export async function persistRestInventoryItemRows(
         );
     }
     log.info(
-        `[NS REST inventory item dump] collection=${NS_REST_INVENTORY_ITEM_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
+        `[NS REST inventory item dump] collection=${targetCollection} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
     );
     return base;
 }

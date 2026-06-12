@@ -1,18 +1,20 @@
+
+
 import { getDb } from "../config/mongdodb.config";
 import { postToNetsuiteForBill } from "./netsuite.client";
 import { SYNC_MODE_BILL as SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
 import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
 
-const PARALLEL_WORKERS = 5;
-const BILL_BATCH = 30;
+const PARALLEL_WORKERS = 2;
+const BILL_BATCH = 10;
 
 // Errors that should never be retried -- mark as permanently failed immediately
 const PERMANENT_ERRORS = [
     "PO not found for otherrefnum",
-    "No matching lines",
     "No billable PO found",
-    "Missing po_number"
+    "Missing po_number",
+    "STRICT_SKU_MISMATCH"
 ];
 
 function isPermanentError(error: string): boolean {
@@ -31,8 +33,9 @@ export const syncBillsToNetsuite = async (): Promise<any[]> => {
     const filter = {
         ns_synced: { $ne: true },
         ns_failed: { $ne: true },
-        ns_skip:   { $ne: true },
-        po_number: { $exists: true, $ne: null }
+        ns_skip: { $ne: true },
+        po_number: { $exists: true, $ne: null },
+
     };
 
     // Fetch all eligible bills (no batch limit here)
@@ -69,7 +72,7 @@ export const syncBillsToNetsuite = async (): Promise<any[]> => {
 
     log.info(`[NS Bill Sync] ${readyBills.length} bills ready (${syncedPOs.length} POs synced)${TEST_MODE ? " (TEST MODE)" : ""}`);
     log.info(`${readyBills}`);
- 
+
 
     if (TEST_MODE || STOP_ON_ERROR) {
         return syncSerial(billCollection, readyBills);
@@ -88,10 +91,10 @@ export const syncBillsToNetsuite = async (): Promise<any[]> => {
             const entry = await syncOneBill(billCollection, readyBills[i]);
             results[i] = entry;
 
-            if (entry.action === "skipped"){ 
+            if (entry.action === "skipped") {
                 skipped++
                 log.warn(`[NS Bill Sync] Bill ${readyBills[i]} skipped: ${entry.error}`);
-            }  else if (entry.success === false) errors++;
+            } else if (entry.success === false) errors++;
             else sent++;
         }
     }
@@ -122,19 +125,97 @@ async function syncOneBill(collection: any, bill: any): Promise<any> {
     const t0 = Date.now();
     const ref = bill.reference_number || `PO${bill.po_number}-${bill.invoice_number}`;
 
+
     try {
         console.log("Trying the sync one bill -------")
-        const result = await withConcurrency(() => postToNetsuiteForBill({
-            action:             SYNC_MODE,
-            po_number:          bill.po_number,
-            invoice_number:     bill.invoice_number,
-            reference_number:   ref,
-            invoice_date:       bill.invoice_date,
-            due_date:           bill.due_date,
-            line_items:         bill.items,
-            po_type:            bill.po_type || "",
-            stocking_warehouse: bill.stocking_warehouse || ""
+        // Extract summary fields for NetSuite sync
+        const freight = bill.summary?.Freight || 0;
+        const salesTax = bill.summary?.SalesTax || 0;
+        const shipping = bill.summary?.Shipping || 0;
+
+        let result = await withConcurrency(() => postToNetsuiteForBill({
+            action: SYNC_MODE,
+            po_number: bill.po_number,
+            invoice_number: bill.invoice_number,
+            reference_number: ref,
+            invoice_date: bill.invoice_date,
+            due_date: bill.due_date,
+            line_items: bill.items,
+            po_type: bill.po_type || "",
+            stocking_warehouse: bill.stocking_warehouse || "",
+            freight,
+            salesTax,
+            shipping
         }), `Bill ${ref}`);
+
+        let poItemSkuUsed = false;
+        let duplicatedPoExists = false;
+
+        // -- Fallback Logic: If first attempt fails due to SKU mismatch, try PO Item SKU --
+        if (result.success === false && (String(result.error).includes("No matching lines") || result.error_code === "STRICT_SKU_MISMATCH")) {
+            log.info(`[NS Bill Sync] SKU mismatch detected for ${ref} (${result.error_code || "partial"}). Attempting PO Item SKU fallback...`);
+
+            const ns_db = await getDb("netsuite");
+            const poCollection = ns_db.collection("suite_purchase_order_dummy");
+
+            const allMatchingPOs = await poCollection.find({ po_number: bill.po_number }).toArray();
+            let targetPO = null;
+
+            if (allMatchingPOs.length > 1) {
+                // Filter by distributor if there's a duplication
+                const distributorPOs = allMatchingPOs.filter(p =>
+                    String(p.distributor || "").trim().toLowerCase() === String(bill.distributor || "").trim().toLowerCase()
+                );
+
+                if (distributorPOs.length === 1) {
+                    targetPO = distributorPOs[0];
+                } else {
+                    duplicatedPoExists = true;
+                    log.warn(`[NS Bill Sync] Could not resolve unique PO for ${bill.po_number} (matches: ${allMatchingPOs.length}, same-distributor: ${distributorPOs.length})`);
+                }
+            } else if (allMatchingPOs.length === 1) {
+                targetPO = allMatchingPOs[0];
+            }
+
+            if (targetPO && targetPO.ns_synced) {
+                const poItems = targetPO.order_items || [];
+                const fallbackItems = JSON.parse(JSON.stringify(bill.items));
+                let changedCount = 0;
+
+                for (let i = 0; i < fallbackItems.length; i++) {
+                    if (poItems[i] && fallbackItems[i].sku !== poItems[i].sku) {
+                        log.info(`[NS Bill Sync] Swapping SKU for retry: ${fallbackItems[i].sku} -> ${poItems[i].sku}`);
+                        fallbackItems[i].sku = poItems[i].sku;
+                        changedCount++;
+                    }
+                }
+
+                if (changedCount > 0) {
+                    log.info(`[NS Bill Sync] Retrying with ${changedCount} swapped SKUs for ${ref}`);
+                    const retryResult = await withConcurrency(() => postToNetsuiteForBill({
+                        action: SYNC_MODE,
+                        po_number: bill.po_number,
+                        invoice_number: bill.invoice_number,
+                        reference_number: ref,
+                        invoice_date: bill.invoice_date,
+                        due_date: bill.due_date,
+                        line_items: fallbackItems,
+                        po_type: bill.po_type || "",
+                        stocking_warehouse: bill.stocking_warehouse || "",
+                        freight,
+                        salesTax,
+                        shipping
+                    }), `PO ${bill.po_number}`);
+
+                    if (retryResult.success !== false) {
+                        result = retryResult;
+                        poItemSkuUsed = true;
+                    } else {
+                        result = retryResult;
+                    }
+                }
+            }
+        }
 
         const ms = Date.now() - t0;
 
@@ -148,6 +229,9 @@ async function syncOneBill(collection: any, bill: any): Promise<any> {
                 return { reference_number: ref, success: false, error: errorStr, ms, permanent: true };
             }
 
+            // Update record with duplicate PO status even on failure
+            await collection.updateOne({ _id: bill._id }, { $set: { duplicated_po_exists: duplicatedPoExists } });
+
             await markFailed(collection, bill, result.error);
             return { reference_number: ref, success: false, error: errorStr, ms };
         }
@@ -156,7 +240,9 @@ async function syncOneBill(collection: any, bill: any): Promise<any> {
         const syncUpdate: any = {
             ns_synced: true,
             ns_synced_at: new Date(),
-            ns_result: result.action
+            ns_result: result.action,
+            po_item_sku: poItemSkuUsed,
+            duplicated_po_exists: duplicatedPoExists
         };
 
         // Persist NetSuite bill internal ID for reference
@@ -174,13 +260,7 @@ async function syncOneBill(collection: any, bill: any): Promise<any> {
             syncUpdate.ns_unmatched_skus = result.unmatchedSkus;
         }
 
-        await collection.updateOne(
-            { _id: bill._id },
-            {
-                $set: syncUpdate,
-                $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
-            }
-        );
+        await markSynced(collection, bill, syncUpdate);
 
         const lineInfo = result.lines ? ` (lines: ${result.lines.updated} kept, ${result.lines.removed} removed, final ${result.lines.final})` : "";
         log.info(`[NS Bill Sync] Synced: ${ref} -> ${result.action}${lineInfo} (${ms}ms)`);
@@ -200,6 +280,22 @@ async function syncOneBill(collection: any, bill: any): Promise<any> {
         await markFailed(collection, bill, rawErr);
         return { reference_number: ref, success: false, error: errMsg, ms };
     }
+}
+
+async function markSynced(collection: any, bill: any, syncUpdate: any) {
+    await collection.updateOne(
+        { _id: bill._id },
+        {
+            $set: syncUpdate,
+            $unset: {
+                ns_error: "",
+                ns_error_at: "",
+                ns_retry_count: "",
+                ns_failed: "",
+                ns_skip_reason: ""
+            }
+        }
+    );
 }
 
 // -- Serial fallback for TEST_MODE / STOP_ON_ERROR --
@@ -299,3 +395,115 @@ export const retryFailedBills = async (resetAll = false): Promise<any> => {
         bills: billList
     };
 };
+
+
+
+// Fetch all eligible bills (no batch limit here)
+export const syncStagedDummyBillsOnce = async (): Promise<any[]> => {
+    log.info(`[NS Bill Sync] Starting -- mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
+
+    const ns_db = await getDb("netsuite");
+    const billCollection = ns_db.collection("suite_vendor_bill_dummy");
+    const poCollection = ns_db.collection("suite_purchase_order_dummy");
+
+    // Base filter: not synced, not failed, not skipped, and must have po_number
+    const filter = {
+        ns_synced: { $exists: false },
+        ns_skip: { $ne: true },
+        po_number: { $exists: true, $ne: null }
+    };
+
+
+    const allBills = await billCollection.find(filter).toArray();
+
+    if (allBills.length === 0) {
+        log.info("[NS Bill Sync] No bills to process. Skipping.");
+        console.log("[NS Bill Sync] No bills to process. Skipping.");
+        return [];
+    }
+
+    console.log("All Bills ", allBills.length)
+
+    const poNumbers = Array.from(new Set(allBills.map((b: any) => b.po_number)));
+    const syncedPOs = await poCollection
+        .find({ po_number: { $in: poNumbers }, ns_synced: true, })
+        .project({ po_number: 1 })
+        .toArray();
+    const syncedPOSet = new Set(syncedPOs.map((p: any) => p.po_number));
+    console.log("syncedPOSet", syncedPOs?.length)
+
+    // Process all eligible bills with synced POs (no batch limit)
+    const readyBills = allBills.filter((b: any) => syncedPOSet.has(b.po_number));
+    const waitingBills = allBills.length - readyBills.length;
+
+    if (waitingBills > 0) {
+        log.info(`[NS Bill Sync] ${waitingBills} bills waiting -- PO not synced yet (will retry next cycle)`);
+    }
+
+    if (readyBills.length === 0) {
+        log.info("[NS Bill Sync] No bills with synced POs. Skipping.");
+        return [];
+    }
+    console.log("syncedPOSet", readyBills?.length)
+    console.log("syncedPOSet", waitingBills)
+
+    if (TEST_MODE || STOP_ON_ERROR) {
+        return syncSerial(billCollection, readyBills);
+    }
+
+    // Group bills by PO number to prevent concurrency errors (collision) on the same PO
+    const poGroups: Record<string, any[]> = {};
+    readyBills.forEach((bill, i) => {
+        if (!poGroups[bill.po_number]) poGroups[bill.po_number] = [];
+        poGroups[bill.po_number].push({ bill, i });
+    });
+    const uniquePoKeys = Object.keys(poGroups);
+
+    let sent = 0;
+    let errors = 0;
+    let skipped = 0;
+    const results: any[] = [];
+    let groupIndex = 0;
+
+    async function worker() {
+        while (groupIndex < uniquePoKeys.length) {
+            const gi = groupIndex++;
+            const billsInGroup = poGroups[uniquePoKeys[gi]];
+
+            // Process all bills for this PO sequentially
+            for (const item of billsInGroup) {
+                const entry = await syncOneBill(billCollection, item.bill);
+                results[item.i] = entry;
+
+                if (entry.action === "skipped") {
+                    skipped++;
+                    log.warn(`[NS Bill Sync] Bill ${item.bill.reference_number || item.bill._id} skipped: ${entry.error}`);
+                } else if (entry.success === false) {
+                    errors++;
+                } else {
+                    sent++;
+                }
+            }
+        }
+    }
+
+    await Promise.all(
+        Array.from({ length: Math.min(PARALLEL_WORKERS, uniquePoKeys.length) }, () => worker())
+    );
+
+    log.info(`[NS Bill Sync] Done -- sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${readyBills.length}`);
+    // Console summary for test/debug
+    const failed = results.filter(r => r.success === false);
+    const failedReasons = {};
+    failed.forEach(r => {
+        if (r.error) {
+            failedReasons[r.error] = (failedReasons[r.error] || 0) + 1;
+        }
+    });
+    console.log(`[NS Bill Sync] Summary: sent=${sent}, skipped=${skipped}, errors=${errors}, total=${readyBills.length}`);
+    if (Object.keys(failedReasons).length > 0) {
+        console.log('[NS Bill Sync] Failure reasons:', failedReasons);
+    }
+    return results;
+};
+

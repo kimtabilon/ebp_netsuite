@@ -94,9 +94,18 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
     }
 
     // ── Find ALL POs by otherrefnum using SuiteQL (exact match) ─────────
-    function findPurchaseOrders(otherrefnum) {
-        var sql = "SELECT id, tranid, status FROM transaction WHERE type = 'PurchOrd' AND otherrefnum = ? ORDER BY id DESC";
-        var resultSet = query.runSuiteQL({ query: sql, params: [String(otherrefnum)] });
+    function findPurchaseOrders(po_number) {
+        var poTranId = "PO" + String(po_number);
+        // Search by tranid (exact) or otherrefnum. 
+        // We prioritize tranid matches to avoid picking up auto-sequenced duplicates.
+        var sql = "SELECT id, tranid, status FROM transaction " +
+                  "WHERE type = 'PurchOrd' AND (tranid = ? OR otherrefnum = ?) " +
+                  "ORDER BY CASE WHEN tranid = ? THEN 0 ELSE 1 END, id DESC";
+        
+        var resultSet = query.runSuiteQL({ 
+            query: sql, 
+            params: [poTranId, String(po_number), poTranId] 
+        });
         var rows = resultSet.asMappedResults();
 
         if (rows.length === 0) return [];
@@ -109,14 +118,15 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                 status: rows[i].status
             });
         }
-        log.audit("PO_MATCHES", "Found " + matches.length + " POs for otherrefnum=" + otherrefnum);
+        log.audit("PO_MATCHES", "Found " + matches.length + " POs for " + po_number + " (Priority: " + poTranId + ")");
         return matches;
     }
 
     // ── Check if a bill already exists by reference_number (otherrefnum) ─
     function findExistingBill(referenceNumber) {
-        var sql = "SELECT id, tranid FROM transaction WHERE type = 'VendBill' AND otherrefnum = ? ORDER BY id DESC";
-        var resultSet = query.runSuiteQL({ query: sql, params: [String(referenceNumber)] });
+        // Search in both tranid (standard reference field) and otherrefnum (external reference field)
+        var sql = "SELECT id, tranid FROM transaction WHERE type = 'VendBill' AND (tranid = ? OR otherrefnum = ?) ORDER BY id DESC";
+        var resultSet = query.runSuiteQL({ query: sql, params: [String(referenceNumber), String(referenceNumber)] });
         var rows = resultSet.asMappedResults();
 
         if (rows.length === 0) return null;
@@ -219,11 +229,11 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                 existingBill = findExistingBill(billRef);
             }
 
-            if (existingBill && action === "skip") {
-                log.audit("BILL_EXISTS_SKIP", "Bill " + existingBill.billNumber + " (ID " + existingBill.id + ") already exists for ref " + billRef + " -- skipping");
+            if (existingBill) {
+                log.audit("BILL_EXISTS", "Bill " + existingBill.billNumber + " (ID " + existingBill.id + ") already exists for ref " + billRef + " -- resolving as success");
                 return {
                     success: true,
-                    action: "skipped",
+                    action: "already_exists",
                     bill: { internalId: existingBill.id, billNumber: existingBill.billNumber },
                     reference_number: billRef
                 };
@@ -309,9 +319,13 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                 bill.setValue({ fieldId: "memo", value: memo });
             }
 
-            // ── Step 5: Resolve location ────────────────────────────────────
+            // ── Step 5: Resolve and set header location ─────────────────────
             var locationId = resolveLocation(po_type, stocking_warehouse);
-            log.audit("LOCATION", po_type + "/" + stocking_warehouse + " -> " + (locationId || "none"));
+            if (locationId) {
+                bill.setValue({ fieldId: "location", value: locationId });
+                log.audit("LOCATION_HEADER", "Set header location to: " + locationId);
+            }
+            log.audit("LOCATION_RESOLVED", po_type + "/" + stocking_warehouse + " -> " + (locationId || "none"));
 
             // ── Step 6: Reconcile lines — update matching, remove rest ───────
             var origLineCount = bill.getLineCount({ sublistId: "item" });
@@ -415,8 +429,46 @@ define(["N/record", "N/search", "N/query", "N/log"], function (record, search, q
                     unmatchedSkus.push(invoiceSkuList[us]);
                 }
             }
+
+            // ── 🆕 SMART FALLBACK LOGIC ──────────────────────────────────
+            // If strict match failed, check if we can fallback to the PO SKU (1-to-1 rule)
             if (unmatchedSkus.length > 0) {
-                log.audit("UNMATCHED_SKUS", "Invoice SKUs not on PO: " + unmatchedSkus.join(", "));
+                var canFallback = false;
+                
+                // Case: 1 Line on Bill + 1 Line on PO -> Map them regardless of SKU string
+                if (invoiceSkuList.length === 1 && origLineCount === 1) {
+                    log.audit("SMART_FALLBACK", "Strict SKU match failed, but 1-to-1 mapping found. Trusting PO line SKU: " + transformLines[0].itemId);
+                    
+                    // Re-process the single line using the PO line
+                    bill.selectLine({ sublistId: "item", line: 0 });
+                    var invMatch = invoiceSkuMap[invoiceSkuList[0]];
+                    
+                    bill.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: invMatch.qty });
+                    bill.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: invMatch.rate });
+                    fixInventoryDetail(bill, invMatch.qty);
+                    
+                    if (locationId) {
+                        try { bill.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId }); } catch(e){}
+                    }
+                    
+                    bill.commitLine({ sublistId: "item" });
+                    
+                    // Clear the error since we've "healed" it
+                    unmatchedSkus = [];
+                    canFallback = true;
+                    linesUpdated = 1;
+                    linesRemoved = 0;
+                }
+
+                if (!canFallback) {
+                    log.error("STRICT_MATCH_FAILED", "Invoice contains SKUs not on PO: " + unmatchedSkus.join(", "));
+                    return {
+                        success: false,
+                        error: "Strict match failed: Unmatched SKUs: " + unmatchedSkus.join(", ") + ". PO lines were: " + JSON.stringify(Object.values(idToSku)),
+                        error_code: "STRICT_SKU_MISMATCH",
+                        unmatchedSkus: unmatchedSkus
+                    };
+                }
             }
 
             // ── Step 7: Clear header class ──────────────────────────────────

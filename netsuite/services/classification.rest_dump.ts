@@ -3,10 +3,12 @@ import log from "../config/logger.config";
 import { extractClassificationIdFromListItem } from "./netsuite.rest.client";
 
 export const NS_REST_CLASSIFICATION_DUMP_COLLECTION = "ns_rest_classification_detail_dump";
+export const NS_REST_CLASSIFICATION_DUMP_COLLECTION_DUMMY = "ns_rest_classification_detail_dump_dummy";
 
 export type PersistRestClassificationRowsOptions = {
     save: boolean;
     queryContext?: Record<string, unknown>;
+    collection?: string;
 };
 
 export type PersistRestClassificationRowsResult = {
@@ -31,9 +33,10 @@ export async function persistRestClassificationRows(
     items: any[],
     options: PersistRestClassificationRowsOptions
 ): Promise<PersistRestClassificationRowsResult> {
+    const targetCollection = options.collection || NS_REST_CLASSIFICATION_DUMP_COLLECTION;
     const base: PersistRestClassificationRowsResult = {
         saved: false,
-        collection: NS_REST_CLASSIFICATION_DUMP_COLLECTION,
+        collection: targetCollection,
         upserted: 0,
         skipped: 0,
         errors: 0,
@@ -49,7 +52,7 @@ export async function persistRestClassificationRows(
     }
 
     const ns_db = await getDb("netsuite");
-    const col = ns_db.collection(NS_REST_CLASSIFICATION_DUMP_COLLECTION);
+    const col = ns_db.collection(targetCollection);
     const now = new Date();
 
     for (const item of items) {
@@ -77,7 +80,7 @@ export async function persistRestClassificationRows(
 
     base.saved = true;
     log.info(
-        `[NS REST classification dump] collection=${NS_REST_CLASSIFICATION_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
+        `[NS REST classification dump] collection=${targetCollection} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
     );
     return base;
 }

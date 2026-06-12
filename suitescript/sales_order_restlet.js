@@ -24,8 +24,9 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
         "amazon": "3rd Party Marketplace : Amazon",
         "walmart": "3rd Party Marketplace : Walmart",
         "newegg": "3rd Party Marketplace : NewEgg",
+        "newegg_business": "3rd Party Marketplace : Newegg Business",
         "ebay": "3rd Party Marketplace : eBay",
-        "shopify": "3rd Party Marketplace : Shopify"
+        "shopify": "Web : eComm"
     };
 
     var FORM_NAME = "Ecomm BP - Sales Order";
@@ -85,30 +86,33 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             if (shipState) {
                 var westStates = ["CA", "OR", "WA", "AZ", "NV", "UT", "CO"];
                 if (westStates.indexOf(shipState) !== -1) {
-                    locationId = findLocationId("California-Chatsworth");
+                    locationId = findLocationId("California - Chatsworth");
                 } else {
                     var centralStates = ["TX", "OK", "KS", "NE", "IA", "MO", "AR", "LA"];
                     if (centralStates.indexOf(shipState) !== -1) {
-                        locationId = findLocationId("Ware2Go-TX(Dallas)");
+                        locationId = findLocationId("Ware2Go - TX (Dallas)");
                     } else {
                         var eastStates = ["NY", "NJ", "PA", "DE", "MD", "VA", "NC", "SC", "GA", "FL", "CT", "MA", "VT", "NH", "ME", "RI"];
                         if (eastStates.indexOf(shipState) !== -1) {
-                            locationId = findLocationId("Ware2Go-PA(Fairless Hills)");
+                            locationId = findLocationId("Ware2Go - PA (Fairless Hills)");
                         }
                     }
                 }
             }
             // Default MFN location if state not matched or no state
             if (!locationId) {
-                locationId = findLocationId("California-Chatsworth");
+                locationId = findLocationId("California - Chatsworth");
             }
         }
         // Rule 3: No fulfillment_channel – use store_type as hint
         else {
-            if (storeType === "amazon") {
+            if (storeType === "shopify") {
+                // For Shopify, no location 
+                locationId = null;
+            } else if (storeType === "amazon") {
                 locationId = findLocationId("Amazon FBA");
-            } else if (storeType === "walmart" || storeType === "newegg" || storeType === "ebay") {
-                locationId = findLocationId("California-Chatsworth");
+            } else if (storeType === "walmart" || storeType === "newegg" || storeType === "newegg_business" || storeType === "ebay") {
+                locationId = findLocationId("California - Chatsworth");
             }
         }
 
@@ -357,6 +361,14 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             var skuList = Array.isArray(items) ? items.map(function (x) { return (x && x.item) || "unknown"; }).join(", ") : "none";
             log.audit("ITEM_MAPPING", "Mapped: " + mappedItems.length + " | Skipped: " + skippedSkus.join(", "));
 
+            // ----- STRICT SKU CHECK (Fail if ANY item is missing) -----
+            if (skippedSkus.length > 0) {
+                return { 
+                    success: false, 
+                    error: "Strict SKU match failed. SKUs not found or inactive in NetSuite: " + skippedSkus.join(", ")
+                };
+            }
+
             // ----- HEADER‑ONLY UPDATE (no valid SKUs) -----
             if (mappedItems.length === 0) {
                 if (existingId) {
@@ -374,6 +386,7 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
             // ----- AT LEAST ONE VALID ITEM – LOAD/CREATE SO -----
             if (existingId && action === "update") {
+                // Use isDynamic: true for consistency with line manipulation methods
                 so = record.load({ type: record.Type.SALES_ORDER, id: existingId, isDynamic: true });
             } else {
                 so = record.create({ type: record.Type.SALES_ORDER, isDynamic: true });
@@ -418,80 +431,77 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
             }
 
             // Location is optional — if unresolved, fields are simply left empty
-            var locationId = resolveLocationId(payload);
+            var locationId = null;
             log.debug("LOCATION_FINAL", locationId ? "Using location ID: " + locationId : "No location resolved — leaving empty");
             if (locationId) {
                 try { so.setValue({ fieldId: "location", value: locationId }); } catch (locHead) { /* form may omit header location */ }
             }
 
-            // ----- LINE ITEMS: remove only lines that have NOT been fulfilled/committed -----
-            // Never attempt to remove a line that has an associated fulfillment — NetSuite will hard-error.
+            // ----- LINE ITEMS CLEANUP -----
+            // Remove only lines that have NOT been fulfilled or committed.
+            // Keeping "needsInventoryDetail" lines was causing duplication; we now allow removal 
+            // if no fulfillment/commitment exists.
             var preClear = so.getLineCount({ sublistId: "item" });
+            log.debug("CLEANUP", "Starting cleanup of " + preClear + " existing lines");
+            
             for (var rm = preClear - 1; rm >= 0; rm--) {
                 try {
                     var lineShipped = parseFloat(so.getSublistValue({ sublistId: "item", fieldId: "quantityfulfilled", line: rm })) || 0;
                     var lineCommitted = parseFloat(so.getSublistValue({ sublistId: "item", fieldId: "quantitycommitted", line: rm })) || 0;
+
                     if (lineShipped > 0 || lineCommitted > 0) {
-                        log.audit("LINE_SKIP_REMOVE", "Line " + rm + " has fulfillment (shipped=" + lineShipped + ", committed=" + lineCommitted + ") — skipping removal");
+                        log.audit("LINE_SKIP_REMOVE", "Line " + rm + " kept (Shipped: " + lineShipped + ", Committed: " + lineCommitted + ")");
                         continue;
                     }
+                    
                     so.removeLine({ sublistId: "item", line: rm });
                 } catch (rmErr) {
                     log.error("LINE_REMOVE_ERR", "Line " + rm + ": " + rmErr.message);
-                    // Do not rethrow — skip this line and continue
                 }
             }
 
-            // ----- Add / update mapped lines -----
-            // If the item already exists on a surviving (fulfilled) line, update it in-place.
-            // Otherwise append a new line.
+            // ----- ADD / UPDATE MAPPED LINES -----
             for (var mi = 0; mi < mappedItems.length; mi++) {
                 var mapped = mappedItems[mi];
                 try {
+                    // Check if the item already exists on a line we had to keep (fulfilled/committed)
                     var existingLine = so.findSublistLineWithValue({
                         sublistId: "item",
                         fieldId: "item",
                         value: mapped.internalId
                     });
+
                     if (existingLine >= 0) {
-                        log.audit("LINE_UPDATE_INPLACE", "SKU " + mapped.sku + " found on surviving line " + existingLine + " — updating in-place");
+                        log.audit("LINE_UPDATE", "SKU " + mapped.sku + " found on existing line " + existingLine + " — updating");
                         so.selectLine({ sublistId: "item", line: existingLine });
                     } else {
+                        log.debug("LINE_ADD", "Adding new line for SKU " + mapped.sku);
                         so.selectNewLine({ sublistId: "item" });
                     }
+
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "item", value: mapped.internalId });
 
                     // Clear createpo — prevent auto-PO for dropship-flagged items.
-                    // Items with isdropshipitem=true can auto-populate createpo="DropShip" via sourcing.
                     try {
                         var autoCreatePO = so.getCurrentSublistValue({ sublistId: "item", fieldId: "createpo" });
                         if (autoCreatePO) {
-                            log.debug("CREATEPO_AUTO", "SKU " + mapped.sku + ": sourcing auto-set createpo=" + autoCreatePO);
                             so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: "", ignoreFieldChange: false });
-                            var afterClear = so.getCurrentSublistValue({ sublistId: "item", fieldId: "createpo" });
-                            if (afterClear) {
-                                log.debug("CREATEPO_RETRY", "\"\" didn't clear (still=" + afterClear + "), trying space...");
-                                so.setCurrentSublistValue({ sublistId: "item", fieldId: "createpo", value: " ", ignoreFieldChange: false });
-                                afterClear = so.getCurrentSublistValue({ sublistId: "item", fieldId: "createpo" });
-                            }
-                            log.debug("CREATEPO_RESULT", "SKU " + mapped.sku + ": cleared to " + (afterClear || "(empty)"));
                         }
-                    } catch (cpErr) {
-                        log.debug("CREATEPO_CLEAR_ERR", mapped.sku + ": " + cpErr.message);
-                    }
+                    } catch (cpErr) { /* ignore */ }
 
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "quantity", value: mapped.qty });
-                    // Only set line location if resolved
-                    if (locationId) {
-                        so.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId });
-                    }
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "price", value: -1 });
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "rate", value: mapped.rate });
                     so.setCurrentSublistValue({ sublistId: "item", fieldId: "amount", value: mapped.amt });
+                    
+                    if (locationId) {
+                        so.setCurrentSublistValue({ sublistId: "item", fieldId: "location", value: locationId });
+                    }
+                    
                     so.commitLine({ sublistId: "item" });
                 } catch (lineErr) {
-                    log.error("LINE_ADD_ERR", "SKU " + mapped.sku + ": " + lineErr.message);
-                    skippedSkus.push(mapped.sku + " (line_error)");
+                    log.error("LINE_SYNC_ERR", "SKU " + mapped.sku + ": " + lineErr.message);
+                    skippedSkus.push(mapped.sku + " (sync_error)");
                 }
             }
 
@@ -501,8 +511,9 @@ define(["N/record", "N/search", "N/log"], function (record, search, log) {
 
             var after = snapshotSO(so);
             var diff = diffSnapshots(before, after);
-            // enableSourcing on save can clear or invalidate lines; ignoreMandatoryFields matches other EBP RESTlets.
-            var savedId = so.save({ enableSourcing: false, ignoreMandatoryFields: true });
+            // enableSourcing: true forces NetSuite to recalculate the header total from
+            // the line amounts — critical fix for zero-total SOs on update.
+            var savedId = so.save({ enableSourcing: true, ignoreMandatoryFields: true });
             log.audit("SUCCESS", "Order " + otherrefnum + " saved → ID: " + savedId);
 
             return {

@@ -1,4 +1,5 @@
 "use strict";
+// Fetch po_numbers with duplicates in suite_purchase_order_dummy
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -84,62 +85,111 @@ function validateWarehouse(stockingWarehouse, poType, poNumber) {
     return warehouse;
 }
 const stagePurchaseOrders = async () => {
-    logger_config_1.default.info("[PO Stage] Starting...");
+    logger_config_1.default.info("[PO Stage Dummy Unique] Starting smart upsert (skip unchanged, reset sync on change)...");
     const po_db = await (0, mongdodb_config_1.getDb)("ebp_pomanager");
-    logger_config_1.default.info("[PO Stage] Connected to ebp_pomanager");
     const ns_db = await (0, mongdodb_config_1.getDb)("netsuite");
-    logger_config_1.default.info("[PO Stage] Connected to netsuite");
-    // ── Filter: only POs after 2026-01-01 with status Shipped or Invoiced ──
-    logger_config_1.default.info("[PO Stage] Querying po_management (Shipped/Invoiced, created >= 2026-01-01)...");
-    const po_cursor = po_db.collection("po_management").find({
-        status2: { $in: ["shipped", "invoiced"] },
-        created_at: { $gte: "2026-01-01" }
-    });
-    const staged = [];
+    const col = ns_db.collection("suite_purchase_order_dummy");
+    const filter = {
+        $and: [
+            { created_at: { $gte: "2026-01-01" } },
+            { po_number: { $exists: true, $ne: null } },
+            {
+                $or: [
+                    { status2: RegExp("^shipped$", "i") },
+                    { status2: RegExp("^invoiced$", "i") },
+                ]
+            }
+        ]
+    };
+    const totalFound = await po_db.collection("po_management").countDocuments(filter);
+    console.log("Total ", totalFound);
+    // Use noCursorTimeout: true to prevent MongoDB from destroying the cursor if the loop takes over 10 minutes
+    const po_cursor = po_db.collection("po_management").find(filter, { noCursorTimeout: true });
+    let total = 0;
+    let processed = 0; // successfully built (no error)
+    let updated = 0; // actually written (new or changed)
+    let skipped = 0; // content identical — not written
+    const bulkOps = [];
     for await (const po of po_cursor) {
-        if (!po.po_number)
-            continue;
-        // Resolve vendor from distributor + payment_type (e.g. "dandh" + "DLL" → D&H - DLL, 118)
-        const vendor = resolveVendor(po.distributor, po.payment_type);
-        // Validate warehouse for stocking POs
-        const validatedWarehouse = validateWarehouse(po.stocking_warehouse, po.po_type, po.po_number);
-        if (!po.po_type) {
-            logger_config_1.default.warn(`[PO Stage] PO ${po.po_number} has no po_type — will not trigger Dropship flow`);
+        total++;
+        let skipReason = null;
+        let stagedPO = null;
+        try {
+            if (!po.po_number) {
+                skipReason = "Missing po_number";
+            }
+            const status = (po.status2 || "").toLowerCase();
+            if (!skipReason && status !== "shipped" && status !== "invoiced") {
+                skipReason = `Invalid status2: ${po.status2}`;
+            }
+            if (!skipReason) {
+                const vendor = resolveVendor(po.distributor, po.payment_type);
+                const validatedWarehouse = validateWarehouse(po.stocking_warehouse, po.po_type, po.po_number);
+                const transformedItems = (po.order_items || []).map((item) => ({
+                    sku: item.sku,
+                    qty: item.quantity || item.qty || 0,
+                    cost: item.amount || item.cost || 0,
+                }));
+                stagedPO = {
+                    po_number: po.po_number,
+                    website_order_number: po.website_order_number || "",
+                    distributor: vendor.name,
+                    distributor_order_number: po.distributor_order_number ?? null,
+                    status: po.status2 || "",
+                    invoice: Array.isArray(po.invoice) ? po.invoice : [],
+                    vendor_id: vendor.id,
+                    tracking: po.tracking ?? null,
+                    order_items: transformedItems,
+                    po_type: po.po_type || "",
+                    stocking_warehouse: validatedWarehouse,
+                    created_at: po.created_at || "",
+                    updated_at: po.updated_at || "",
+                    skipReason: null,
+                    error: null,
+                };
+                processed++;
+            }
         }
-        // Transform order_items: database uses 'quantity'/'amount', RESTlet expects 'qty'/'cost'
-        const transformedItems = (po.order_items || []).map((item) => ({
-            sku: item.sku,
-            qty: item.quantity || item.qty || 0,
-            cost: item.amount || item.cost || 0
-        }));
-        staged.push({
-            po_number: po.po_number,
-            website_order_number: po.website_order_number || "",
-            distributor: vendor.name,
-            distributor_order_number: po.distributor_order_number ?? null,
-            status: po.status2 || "",
-            invoice: Array.isArray(po.invoice) ? po.invoice : [],
-            vendor_id: vendor.id,
-            tracking: po.tracking ?? null,
-            order_items: transformedItems,
-            po_type: po.po_type || "",
-            stocking_warehouse: validatedWarehouse,
-            created_at: po.created_at || "",
-            updated_at: po.updated_at || ""
-        });
-    }
-    logger_config_1.default.info(`[PO Stage] Found ${staged.length} POs matching filter`);
-    if (staged.length > 0) {
-        logger_config_1.default.info("[PO Stage] Upserting to netsuite.suite_purchase_order...");
-        await ns_db.collection("suite_purchase_order").bulkWrite(staged.map(po => ({
+        catch (err) {
+            skipReason = `Exception: ${err.message || String(err)}`;
+        }
+        if (!po.po_number) {
+            skipped++;
+            continue;
+        }
+        if (!stagedPO) {
+            skipped++;
+            // Skipped or errored — we only want to stage valid data, so ignore this PO completely.
+            continue;
+        }
+        // Only insert NEW purchase orders. 
+        // Using $setOnInsert ensures that if the PO already exists in staging, it is completely ignored.
+        updated++;
+        bulkOps.push({
             updateOne: {
                 filter: { po_number: po.po_number },
-                update: { $set: po },
-                upsert: true
+                update: {
+                    $setOnInsert: {
+                        ...stagedPO,
+                        staged_at: new Date().toISOString()
+                    }
+                },
+                upsert: true,
             }
-        })));
+        });
+        // Execute in chunks of 500 to prevent connection timeouts
+        if (bulkOps.length >= 500) {
+            await col.bulkWrite(bulkOps, { ordered: false });
+            bulkOps.length = 0; // Clear the array
+        }
     }
-    logger_config_1.default.info(`[PO Stage] Staged ${staged.length} purchase orders to netsuite.suite_purchase_order`);
-    return { processed: staged.length };
+    if (bulkOps.length > 0) {
+        await col.bulkWrite(bulkOps, { ordered: false });
+    }
+    // Always close the cursor explicitly when using noCursorTimeout
+    await po_cursor.close();
+    logger_config_1.default.info(`[PO Stage Dummy Unique] Done — total=${total}, processed=${processed}, ` +
+        `updated=${updated}, skipped=${skipped}`);
+    return { processed, updated, skipped, total };
 };
 exports.stagePurchaseOrders = stagePurchaseOrders;

@@ -9,7 +9,7 @@ const mongdodb_config_1 = require("../config/mongdodb.config");
 const logger_config_1 = __importDefault(require("../config/logger.config"));
 const netsuite_rest_client_1 = require("./netsuite.rest.client");
 /** Mongo collection for raw NetSuite REST sales order payloads (one document per order row). */
-exports.NS_REST_SO_DUMP_COLLECTION = "ns_rest_sales_order_detail_dump";
+exports.NS_REST_SO_DUMP_COLLECTION = "ns_rest_sales_order_detail_dump_dummy";
 function extractNsIdFromRestPayload(item) {
     if (item == null || typeof item !== "object")
         return null;
@@ -65,6 +65,11 @@ async function persistRestSalesOrderItems(items, options) {
         }
     }
     base.saved = true;
+    if (base.upserted === 0 && items.length > 0) {
+        base.hint =
+            "No documents upserted — check persist.skipped (missing ns id on rows) or persist.errors (Mongo). Collection: netsuite." +
+                exports.NS_REST_SO_DUMP_COLLECTION;
+    }
     logger_config_1.default.info(`[NS REST dump] collection=${exports.NS_REST_SO_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`);
     return base;
 }

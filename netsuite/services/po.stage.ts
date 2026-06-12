@@ -1,3 +1,5 @@
+// Fetch po_numbers with duplicates in suite_purchase_order_dummy
+
 import { getDb } from "../config/mongdodb.config";
 import log from "../config/logger.config";
 
@@ -7,7 +9,7 @@ import log from "../config/logger.config";
 // netsuiteName must match the NetSuite location record name exactly
 // (these are the names used by the RESTlet's WAREHOUSE_MAP → findLocationByName)
 const WAREHOUSE_MAP: Record<string, { netsuiteName: string; address: string }> = {
-    "MW":     { netsuiteName: "California - Chatsworth", address: "21540 Prairie Street, Suite F, Chatsworth CA 91311" },
+    "MW": { netsuiteName: "California - Chatsworth", address: "21540 Prairie Street, Suite F, Chatsworth CA 91311" },
     "W2G-PA": { netsuiteName: "Ware2Go - PA (Fairless Hills)", address: "1 Kresge Road, Fairless Hills, PA 19030" },
     "W2G-IL": { netsuiteName: "Ware2Go - IL (Aurora)", address: "1206 NAGEL BLVD, Batavia, IL 60510" },
     "W2G-KY": { netsuiteName: "Ware2Go - KY (Hebron)", address: "2525 Litton Lane, Hebron, KY 41048" },
@@ -21,24 +23,24 @@ const VALID_WAREHOUSE_CODES = Object.keys(WAREHOUSE_MAP);
 // Default = non-DLL variant (NET/TERM)
 const VENDOR_MAP: Record<string, { default: { name: string; id: number }; dll: { name: string; id: number } }> = {
     "dandh": {
-        default: { name: "D&H",                          id: 119 },
-        dll:     { name: "D&H - DLL",                    id: 118 }
+        default: { name: "D&H", id: 119 },
+        dll: { name: "D&H - DLL", id: 118 }
     },
     "ingram": {
-        default: { name: "Ingram Micro - NET",           id: 133 },
-        dll:     { name: "Ingram Micro - DLL",            id: 269 }
+        default: { name: "Ingram Micro - NET", id: 133 },
+        dll: { name: "Ingram Micro - DLL", id: 269 }
     },
     "suppliesnetwork": {
-        default: { name: "Distribution Management",      id: 268 },
-        dll:     { name: "Distribution Management - DLL", id: 131 }
+        default: { name: "Distribution Management", id: 268 },
+        dll: { name: "Distribution Management - DLL", id: 131 }
     },
     "synnex": {
-        default: { name: "TD Synnex - Term",             id: 116 },
-        dll:     { name: "TD Synnex - DLL",               id: 117 }
+        default: { name: "TD Synnex - Term", id: 116 },
+        dll: { name: "TD Synnex - DLL", id: 117 }
     },
     "techdata": {
-        default: { name: "TD Synnex - Term",             id: 116 },
-        dll:     { name: "TD Synnex - DLL",               id: 117 }
+        default: { name: "TD Synnex - Term", id: 116 },
+        dll: { name: "TD Synnex - DLL", id: 117 }
     }
 };
 
@@ -93,102 +95,225 @@ export function validateWarehouse(
 }
 
 interface POItem {
-    sku:  string;
-    qty:  string | number;
+    sku: string;
+    qty: string | number;
     cost: string | number;
 }
 
 export interface StagedPO {
-    po_number:                number;
-    website_order_number:     string;
-    distributor:              string;
+    po_number: number;
+    website_order_number: string;
+    distributor: string;
     distributor_order_number: string | number | null;
-    status:                   string;
-    invoice:                  any[];
-    vendor_id:                number | null;
-    tracking:                 string | null;
-    order_items:              POItem[];
-    po_type:                  string;         // "Dropship" | "Stocking" | ""
-    stocking_warehouse:       string;         // "MW" | "W2G-PA" | "W2G-IL" | "W2G-KY" | "W2G-TX" | ""
-    created_at:               string;
-    updated_at:               string;
+    status: string;
+    invoice: any[];
+    vendor_id: number | null;
+    tracking: string | null;
+    order_items: POItem[];
+    po_type: string;         // "Dropship" | "Stocking" | ""
+    stocking_warehouse: string;         // "MW" | "W2G-PA" | "W2G-IL" | "W2G-KY" | "W2G-TX" | ""
+    created_at: string;
+    updated_at: string;
 }
 
-export const stagePurchaseOrders = async (): Promise<{ processed: number }> => {
-    log.info("[PO Stage] Starting...");
+
+
+
+export const stagePurchaseOrders = async (): Promise<{ processed: number, updated: number, skipped: number, total: number }> => {
+    log.info("[PO Stage Dummy Unique] Starting smart upsert (skip unchanged, reset sync on change)...");
 
     const po_db = await getDb("ebp_pomanager");
-    log.info("[PO Stage] Connected to ebp_pomanager");
     const ns_db = await getDb("netsuite");
-    log.info("[PO Stage] Connected to netsuite");
+    const col = ns_db.collection("suite_purchase_order_dummy");
 
-    // ── Filter: only POs after 2026-01-01 with status Shipped or Invoiced ──
-    log.info("[PO Stage] Querying po_management (Shipped/Invoiced, created >= 2026-01-01)...");
-    const po_cursor = po_db.collection("po_management").find({
-        status2: { $in: ["shipped", "invoiced"] },
-        created_at: { $gte: "2026-01-01" }
-    });
+    const filter = {
+        $and: [
+            { created_at: { $gte: "2026-01-01" } },
+            { po_number: { $exists: true, $ne: null } },
+            {
+                $or: [
+                    { status2: RegExp("^shipped$", "i") },
+                    { status2: RegExp("^invoiced$", "i") },
+                ]
+            }
+        ]
+    };
 
-    const staged: StagedPO[] = [];
+    const totalFound = await po_db.collection("po_management").countDocuments(filter);
+    console.log("Total ", totalFound);
+
+    // Use noCursorTimeout: true to prevent MongoDB from destroying the cursor if the loop takes over 10 minutes
+    const po_cursor = po_db.collection("po_management").find(filter, { noCursorTimeout: true });
+    let total = 0;
+    let processed = 0;  // successfully built (no error)
+    let updated = 0;  // actually written (new or changed)
+    let skipped = 0;  // content identical — not written
+
+    const bulkOps: any[] = [];
 
     for await (const po of po_cursor) {
-        if (!po.po_number) continue;
+        total++;
+        let skipReason: string | null = null;
+        let stagedPO: any = null;
 
-        // Resolve vendor from distributor + payment_type (e.g. "dandh" + "DLL" → D&H - DLL, 118)
-        const vendor = resolveVendor(po.distributor, po.payment_type);
+        try {
+            if (!po.po_number) { skipReason = "Missing po_number"; }
 
-        // Validate warehouse for stocking POs
-        const validatedWarehouse = validateWarehouse(
-            po.stocking_warehouse,
-            po.po_type,
-            po.po_number
-        );
+            const status = (po.status2 || "").toLowerCase();
+            if (!skipReason && status !== "shipped" && status !== "invoiced") {
+                skipReason = `Invalid status2: ${po.status2}`;
+            }
 
-        if (!po.po_type) {
-            log.warn(`[PO Stage] PO ${po.po_number} has no po_type — will not trigger Dropship flow`);
+            if (!skipReason) {
+                const vendor = resolveVendor(po.distributor, po.payment_type);
+                const validatedWarehouse = validateWarehouse(po.stocking_warehouse, po.po_type, po.po_number);
+
+                const transformedItems = (po.order_items || []).map((item: any) => ({
+                    sku: item.sku,
+                    qty: item.quantity || item.qty || 0,
+                    cost: item.amount || item.cost || 0,
+                }));
+
+                stagedPO = {
+                    po_number: po.po_number,
+                    website_order_number: po.website_order_number || "",
+                    distributor: vendor.name,
+                    distributor_order_number: po.distributor_order_number ?? null,
+                    status: po.status2 || "",
+                    invoice: Array.isArray(po.invoice) ? po.invoice : [],
+                    vendor_id: vendor.id,
+                    tracking: po.tracking ?? null,
+                    order_items: transformedItems,
+                    po_type: po.po_type || "",
+                    stocking_warehouse: validatedWarehouse,
+                    created_at: po.created_at || "",
+                    updated_at: po.updated_at || "",
+                    skipReason: null,
+                    error: null,
+                };
+                processed++;
+            }
+        } catch (err: any) {
+            skipReason = `Exception: ${err.message || String(err)}`;
         }
 
-        // Transform order_items: database uses 'quantity'/'amount', RESTlet expects 'qty'/'cost'
-        const transformedItems = (po.order_items || []).map((item: any) => ({
-            sku: item.sku,
-            qty: item.quantity || item.qty || 0,
-            cost: item.amount || item.cost || 0
-        }));
+        if (!po.po_number) {
+            skipped++
+            continue;
+        }
 
-        staged.push({
-            po_number:                po.po_number,
-            website_order_number:     po.website_order_number     || "",
-            distributor:              vendor.name,
-            distributor_order_number: po.distributor_order_number  ?? null,
-            status:                   po.status2                   || "",
-            invoice:                  Array.isArray(po.invoice) ? po.invoice : [],
-            vendor_id:                vendor.id,
-            tracking:                 po.tracking ?? null,
-            order_items:              transformedItems,
-            po_type:                  po.po_type                  || "",
-            stocking_warehouse:       validatedWarehouse,
-            created_at:               po.created_at  || "",
-            updated_at:               po.updated_at  || ""
+        if (!stagedPO) {
+            skipped++
+            // Skipped or errored — we only want to stage valid data, so ignore this PO completely.
+            continue;
+        }
+
+        // Only insert NEW purchase orders. 
+        // Using $setOnInsert ensures that if the PO already exists in staging, it is completely ignored.
+        updated++;
+        bulkOps.push({
+            updateOne: {
+                filter: { po_number: po.po_number },
+                update: {
+                    $setOnInsert: {
+                        ...stagedPO,
+                        staged_at: new Date().toISOString()
+                    }
+                },
+                upsert: true,
+            }
         });
+
+        // Execute in chunks of 500 to prevent connection timeouts
+        if (bulkOps.length >= 500) {
+            await col.bulkWrite(bulkOps, { ordered: false });
+            bulkOps.length = 0; // Clear the array
+        }
     }
 
-    log.info(`[PO Stage] Found ${staged.length} POs matching filter`);
-
-    const staged_with_items = staged.filter(po => po.order_items && po.order_items.length > 0);
-
-    if (staged_with_items.length > 0) {
-        log.info(`[PO Stage] Upserting ${staged_with_items.length} POs with items to netsuite.suite_purchase_order...`);
-        await ns_db.collection<StagedPO>("suite_purchase_order").bulkWrite(
-            staged_with_items.map(po => ({
-                updateOne: {
-                    filter: { po_number: po.po_number },
-                    update: { $set: po },
-                    upsert: true
-                }
-            }))
-        );
+    if (bulkOps.length > 0) {
+        await col.bulkWrite(bulkOps, { ordered: false });
     }
 
-    log.info(`[PO Stage] Staged ${staged_with_items.length} purchase orders to netsuite.suite_purchase_order`);
-    return { processed: staged_with_items.length };
+    // Always close the cursor explicitly when using noCursorTimeout
+    await po_cursor.close();
+
+    log.info(
+        `[PO Stage Dummy Unique] Done — total=${total}, processed=${processed}, ` +
+        `updated=${updated}, skipped=${skipped}`
+    );
+    return { processed, updated, skipped, total };
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -26,6 +26,7 @@ const buildOAuthHeader = (url: string, method: string): string => {
         realm: process.env.NS_ACCOUNT_ID!
     });
 
+    const batchSize = 10;
     const token = {
         key: process.env.NS_TOKEN_ID!,
         secret: process.env.NS_TOKEN_SECRET!
@@ -35,7 +36,7 @@ const buildOAuthHeader = (url: string, method: string): string => {
     return oauth.toHeader(authData).Authorization;
 };
 
-const RESTLET_TIMEOUT_MS = 30_000; // 30s — prevents hung calls from blocking concurrency slots forever
+const RESTLET_TIMEOUT_MS = 120_000; // 120s — increased to handle large batches of record updates
 
 const post = async (scriptId: string, deployId: string, payload: object): Promise<any> => {
     console.log("scriptId" , scriptId)
@@ -86,19 +87,19 @@ const post = async (scriptId: string, deployId: string, payload: object): Promis
 export const postToNetsuite = (payload: object) =>
     post(process.env.RESTLET_SCRIPT_ID!, process.env.RESTLET_DEPLOY_ID!, payload);
 
-// Purchase Order restlet
-export const postToNetsuiteForPO = (payload: object) =>
-    post(process.env.RESTLET_PO_SCRIPT_ID!, process.env.RESTLET_PO_DEPLOY_ID!, payload);
-
-// Purchase Order restlet — batch mode (multiple POs in one invocation)
-export const postBatchToNetsuiteForPO = (payloads: object[]): Promise<any> => {
-    const url = buildRestletUrl(process.env.RESTLET_PO_SCRIPT_ID!, process.env.RESTLET_PO_DEPLOY_ID!);
+// Sales Order restlet — batch mode (multiple SOs in one invocation)
+export const postBatchToNetsuiteForSO = async (payloads: object[]): Promise<any> => {
+    const url = buildRestletUrl(process.env.RESTLET_SCRIPT_ID!, process.env.RESTLET_DEPLOY_ID!);
     const authHeader = buildOAuthHeader(url, "POST");
-    log.info(`[NS Client] BATCH POST → ${url} (${payloads.length} POs)`);
-    return axios.post(url, { batch: payloads }, {
-        headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        timeout: 180_000,  // 3 min — batch calls take longer
-    }).then((r: any) => r.data).catch((err: any) => {
+    log.info(`[NS Client] BATCH POST SO → ${url} (${payloads.length} SOs)`);
+    try {
+        const response = await axios.post(url, { batch: payloads }, {
+            headers: { Authorization: authHeader, "Content-Type": "application/json" },
+            timeout: 180_000,
+        });
+        return response.data;
+    } catch (err: any) {
+        log.error(`[NS Client] Batch SO call failed`, { url, error: err.message });
         const status = err.response?.status;
         const body = err.response?.data;
         const msg = typeof body === "string" ? body : JSON.stringify(body || err.message);
@@ -106,21 +107,61 @@ export const postBatchToNetsuiteForPO = (payloads: object[]): Promise<any> => {
             log.error(`[NS Client] ⚠️ CONCURRENCY LIMIT HIT on batch call (HTTP ${status})`, { url, error: msg });
         }
         throw err;
-    });
+    }
+};
+
+// Purchase Order restlet
+export const postToNetsuiteForPO = (payload: object) =>
+    post(process.env.RESTLET_PO_SCRIPT_ID!, process.env.RESTLET_PO_DEPLOY_ID!, payload);
+
+// Purchase Order restlet — batch mode (multiple POs in one invocation)
+export const postBatchToNetsuiteForPO = async (payloads: object[]): Promise<any> => {
+    const url = buildRestletUrl(process.env.RESTLET_PO_SCRIPT_ID!, process.env.RESTLET_PO_DEPLOY_ID!);
+    const authHeader = buildOAuthHeader(url, "POST");
+    log.info(`[NS Client] BATCH POST → ${url} (${payloads.length} POs)`);
+    log.info(`   (${JSON.stringify(payloads)} )`);
+    try {
+        const response = await axios.post(url, { batch: payloads }, {
+            headers: { Authorization: authHeader, "Content-Type": "application/json" },
+            timeout: 180_000,  // 3 min — batch calls take longer
+        });
+        // log.debug(`[NS Client] Batch call response`, response.data);
+        return response.data;
+    } catch (err: any) {
+        log.error(`[NS Client] Batch call failed`, { url, error: err.message });
+        const status = err.response?.status;
+        const body = err.response?.data;
+        const msg = typeof body === "string" ? body : JSON.stringify(body || err.message);
+        if (status === 429 || msg.includes("SSS_REQUEST_LIMIT_EXCEEDED") || msg.includes("concurrent request")) {
+            log.error(`[NS Client] ⚠️ CONCURRENCY LIMIT HIT on batch call (HTTP ${status})`, { url, error: msg });
+        }
+        throw err;
+    }
 };
 
 // Vendor Bill restlet
 export const postToNetsuiteForBill = (payload: object) =>
     post(process.env.RESTLET_BILL_SCRIPT_ID!, process.env.RESTLET_BILL_DEPLOY_ID!, payload);
 
+// Vendor Credit restlet
+export const postToNetsuiteForCreditMemo = (payload: object) =>
+    post(process.env.RESTLET_CREDIT_SCRIPT_ID!, process.env.RESTLET_CREDIT_DEPLOY_ID!, payload);
+
+// Item Fulfillment restlet
+export const postToNetsuiteForIF = (payload: object) =>{
+       log.error("payload >>>" ,payload)
+   return post(process.env.RESTLET_IF_SCRIPT_ID!, process.env.RESTLET_IF_DEPLOY_ID!, payload);}
+
 // Diagnostic RESTlet — call with sections to inspect account config
 export const callDiagnostic = async (payload: object): Promise<any> => {
     const scriptId = process.env.RESTLET_DIAG_SCRIPT_ID;
     const deployId = process.env.RESTLET_DIAG_DEPLOY_ID;
+   
     if (!scriptId || !deployId) {
         log.error("[DIAG] Missing RESTLET_DIAG_SCRIPT_ID or RESTLET_DIAG_DEPLOY_ID in .env");
         return null;
     }
+   
     return post(scriptId, deployId, payload);
 };
 
@@ -158,3 +199,5 @@ export const testNetsuiteAuth = async (): Promise<void> => {
         log.error("[AUTH] FAILED", { data });
     }
 };
+
+ 

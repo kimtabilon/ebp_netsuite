@@ -9,7 +9,10 @@ const node_cron_1 = __importDefault(require("node-cron"));
 const logger_config_1 = __importDefault(require("./config/logger.config"));
 const mongdodb_config_1 = require("./config/mongdodb.config");
 const sales_order_sync_1 = require("./services/sales_order.sync");
+const po_stage_1 = require("./services/po.stage");
 const po_sync_1 = require("./services/po.sync");
+const bill_stage_1 = require("./services/bill.stage");
+const bill_sync_1 = require("./services/bill.sync");
 const concurrency_config_1 = require("./config/concurrency.config");
 // Route modules
 const so_route_1 = __importDefault(require("./route/so.route"));
@@ -19,7 +22,12 @@ const bill_route_1 = __importDefault(require("./route/bill.route"));
 const item_route_1 = __importDefault(require("./route/item.route"));
 const ns_rest_records_route_1 = __importDefault(require("./route/ns_rest_records.route"));
 const index_route_1 = __importDefault(require("./route/index.route"));
+const credit_memo_route_1 = __importDefault(require("./route/credit_memo.route"));
+const item_fulfillment_route_1 = __importDefault(require("./route/item_fulfillment.route"));
 const sales_order_stage_1 = require("./services/sales_order.stage");
+const ns_rest_compare_fields_1 = require("./config/ns_rest_compare.fields");
+const warehouse_w2g_1 = require("./services/warehouse.w2g");
+const inbound_w2g_1 = require("./services/inbound.w2g");
 dotenv_1.default.config();
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTES
@@ -34,58 +42,14 @@ app_1.default.use("/api/v4", diagnostic_route_1.default);
 app_1.default.use("/api/v4", item_route_1.default);
 app_1.default.use("/api/v4", ns_rest_records_route_1.default);
 app_1.default.use("/api/v4", index_route_1.default);
+app_1.default.use("/api/v4", credit_memo_route_1.default);
+app_1.default.use("/api/v4", item_fulfillment_route_1.default);
 // ═══════════════════════════════════════════════════════════════════════════════
 // SERVER
 // ═══════════════════════════════════════════════════════════════════════════════
 const PORT = 5002;
-const server = app_1.default.listen(PORT, () => {
+const server = app_1.default.listen(PORT, async () => {
     logger_config_1.default.info(`Server running at http://localhost:${PORT}`);
-    logger_config_1.default.info(`──── Sales Orders ────`);
-    logger_config_1.default.info(`  Stage SO:        GET  /stage-so`);
-    logger_config_1.default.info(`  Staged products: GET  /staged-so-products?limit=&skip=&all=true`);
-    logger_config_1.default.info(`  Sync SO:         GET  /sync-so`);
-    logger_config_1.default.info(`  Sync one SO:     POST /sync-so-one`);
-    logger_config_1.default.info(`  Reset one SO:    POST /reset-one-so`);
-    logger_config_1.default.info(`  Retry Failed SO: GET  /retry-failed-so`);
-    logger_config_1.default.info(`  Reset SO Sync:   GET|POST /reset-so-sync`);
-    logger_config_1.default.info(`  Migrate SO:      GET  /migrate-so`);
-    logger_config_1.default.info(`  Migrate MV:      GET  /migrate-so-multivendor`);
-    logger_config_1.default.info(`  Test SO Flow:    GET  /test-so-flow`);
-    logger_config_1.default.info(`  Test Vendor SO:  GET  /test-so-vendor?store=amazon|walmart|newegg|ebay|shopify`);
-    logger_config_1.default.info(`  Direct SO Test:  POST /so-test`);
-    logger_config_1.default.info(`  Delete All SO:   GET|POST /delete-all-so`);
-    logger_config_1.default.info(`──── Purchase Orders ────`);
-    logger_config_1.default.info(`  Sync PO:         GET  /sync-po`);
-    logger_config_1.default.info(`  Retry Failed PO: GET  /retry-failed-po`);
-    logger_config_1.default.info(`  Test PO Flow:    POST /test-po-flow?type=dropship|stocking`);
-    logger_config_1.default.info(`  Direct PO Test:  POST /po-test`);
-    logger_config_1.default.info(`  Dropship Ready:  GET  /dropship-ready`);
-    logger_config_1.default.info(`  Delete All PO:   GET|POST /delete-all-po`);
-    logger_config_1.default.info(`──── Vendor Bills ────`);
-    logger_config_1.default.info(`  Stage Bills:     GET  /stage-bill`);
-    logger_config_1.default.info(`  Sync Bills:      GET  /sync-bill`);
-    logger_config_1.default.info(`  Retry Failed:    GET  /retry-failed-bill`);
-    logger_config_1.default.info(`  Reset Sync:      GET|POST /reset-bill-sync`);
-    logger_config_1.default.info(`  Bill Ready:      GET  /bill-ready`);
-    logger_config_1.default.info(`  Direct Bill:     POST /bill-test`);
-    logger_config_1.default.info(`──── Cron Schedule ────`);
-    logger_config_1.default.info(`  SO:   every 20 min  (:00, :20, :40)`);
-    logger_config_1.default.info(`  PO:   every 20 min  (:07, :27, :47)`);
-    logger_config_1.default.info(`  Bill: every 20 min  (:14, :34, :54) [DISABLED]`);
-    logger_config_1.default.info(`  SO retry:   daily 3:00 AM`);
-    logger_config_1.default.info(`  PO retry:   daily 3:15 AM`);
-    logger_config_1.default.info(`  Bill retry: daily 3:30 AM [DISABLED]`);
-    logger_config_1.default.info(`──── Items & Diagnostics ────`);
-    logger_config_1.default.info(`  Items:           GET  /netsuite-items`);
-    logger_config_1.default.info(`  Items Full:      GET  /netsuite-items-full`);
-    logger_config_1.default.info(`  POs:             GET  /netsuite-po`);
-    logger_config_1.default.info(`  Diagnostic:      GET|POST /diagnostic`);
-    logger_config_1.default.info(`  Cleanup:         GET|POST /cleanup`);
-    logger_config_1.default.info(`──── NetSuite REST record dumps (SuiteTalk) — base /api/v4 ────`);
-    logger_config_1.default.info(`  Inventory items: GET  /api/v4/inventoryItem?persistDb=true  (+ /api/v4/inventoryItem/:id)`);
-    logger_config_1.default.info(`  Class (NS):      GET  /api/v4/classification (+ /api/v4/classification/:id)`);
-    logger_config_1.default.info(`  Item fulfill.:   GET  /api/v4/itemFulfillment (+ /api/v4/itemFulfillment/:id)`);
-    logger_config_1.default.info(`  Item receipts:   GET  /api/v4/itemReceipt (+ /api/v4/itemReceipt/:id)`);
     // Ensure indexes after server boots (non-blocking)
     ensureIndexes().catch(err => logger_config_1.default.error("[STARTUP] Index creation failed", { error: err.message }));
 });
@@ -120,7 +84,10 @@ async function ensureIndexes() {
         await c.createIndex({ ns_internal_id: 1 }, { unique: true, name: `idx_ns_rest_${name}_dump_internal_id`, background: true });
         await c.createIndex({ dumped_at: -1 }, { name: `idx_ns_rest_${name}_dump_dumped_at`, background: true });
     }
-    logger_config_1.default.info("[STARTUP] MongoDB indexes ensured for suite_sales_order, suite_purchase_order, NS REST SO/PO dump, inventory/classification/IF/IR dump collections");
+    const nsRestCompareLog = nsDb.collection(ns_rest_compare_fields_1.NS_REST_COMPARE_LOG_COLLECTION);
+    await nsRestCompareLog.createIndex({ compared_at: -1 }, { name: "idx_ns_rest_compare_log_compared_at", background: true });
+    await nsRestCompareLog.createIndex({ record_type: 1, ns_internal_id: 1, compared_at: -1 }, { name: "idx_ns_rest_compare_log_type_id_time", background: true });
+    logger_config_1.default.info("[STARTUP] MongoDB indexes ensured for suite_sales_order, suite_purchase_order, NS REST SO/PO dump, inventory/classification/IF/IR dump, compare diff log");
 }
 // ═══════════════════════════════════════════════════════════════════════════════
 // CRON SAFETY — wraps a sync function with a hard timeout so a hung call
@@ -138,125 +105,100 @@ function withTimeout(fn, label, ms = CRON_TIMEOUT_MS) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // CRON JOBS
 // ═══════════════════════════════════════════════════════════════════════════════
-// ─── Every 20 min — Sales Orders (staging + sync) ─────────────────────────
-// SO at :00, :20, :40 — runs before PO (PO at :07, :27, :47)
-let soSyncRunning = false;
-async function runSOSync() {
-    if (soSyncRunning) {
-        logger_config_1.default.warn("[CRON] [SO] Skipping — previous sync still running");
+// 1. W2G dummp cron jobs 
+// Job 1: Runs every 2 hours
+node_cron_1.default.schedule('0 */2 * * *', async () => {
+    try {
+        await (0, warehouse_w2g_1.getWare2SoOrderOutbound)();
+    }
+    catch (error) {
+        logger_config_1.default.info(' W2g SO Outbound cron failed : ', error);
+    }
+    try {
+        await (0, inbound_w2g_1.syncAllWare2GoInboundShipments)();
+    }
+    catch (error) {
+        logger_config_1.default.info(' W2g Inbound Shipment cron failed : ', error);
+    }
+    logger_config_1.default.info('Every 2 hours job executed at: ' + new Date().toISOString());
+});
+// // Job 2: Runs every Saturday at 00:00 (midnight)
+node_cron_1.default.schedule('0 0 * * 6', async () => {
+    try {
+        await (0, warehouse_w2g_1.getWare2SoOrderOutbound)({ forceRestart: false, retryFailedOnly: false, all: true });
+    }
+    catch (error) {
+        logger_config_1.default.info('Weekly W2g SO Outbound cron cron failed : ', error);
+    }
+    try {
+        await (0, inbound_w2g_1.syncAllWare2GoInboundShipments)({ forceRestart: false, retryFailedOnly: false, all: true });
+    }
+    catch (error) {
+        logger_config_1.default.info('Weekly W2g Inbound Shipment cron failed : ', error);
+    }
+    logger_config_1.default.info('Weekly Saturday job executed at: ' + new Date().toISOString());
+});
+// Define a flag outside the cron job
+let isSyncJobRunning = false;
+node_cron_1.default.schedule('0 */5 * * *', async () => {
+    if (isSyncJobRunning) {
+        logger_config_1.default.info('Previous sync job is still running. Skipping this cron run.');
         return;
     }
-    soSyncRunning = true;
+    isSyncJobRunning = true;
+    logger_config_1.default.info('Starting scheduled sync job...');
     try {
-        logger_config_1.default.info("[CRON] [SO] Step 1 — Staging sales orders...");
-        await withTimeout(() => (0, sales_order_stage_1.stageSalesOrders)(), "SO-Stage");
-        logger_config_1.default.info("[CRON] [SO] Step 2 — Pushing to NetSuite ERP...");
-        await withTimeout(() => (0, sales_order_sync_1.syncSalesOrdersToNetsuite)(), "SO-Sync");
+        try {
+            await (0, sales_order_stage_1.stageSalesOrders)();
+            console.log("SO run");
+        }
+        catch (error) {
+            console.log(error);
+        }
+        try {
+            await (0, sales_order_sync_1.syncDummySalesOrdersToNetsuite)();
+            console.log("SO sync run");
+        }
+        catch (error) {
+            console.log(error);
+        }
+        try {
+            await (0, po_stage_1.stagePurchaseOrders)();
+            console.log("PO stage run");
+        }
+        catch (error) {
+            console.log(error);
+        }
+        try {
+            await (0, po_sync_1.syncPurchaseOrdersToNetsuite)();
+            console.log("PO sync run");
+        }
+        catch (error) {
+            console.log(error);
+        }
+        try {
+            await (0, bill_stage_1.stageBills)();
+            console.log("Bill stage run");
+        }
+        catch (error) {
+            console.log(error);
+        }
+        try {
+            await (0, bill_sync_1.syncStagedDummyBillsOnce)();
+            console.log("Bill Sync run");
+        }
+        catch (error) {
+            console.log(error);
+        }
     }
-    catch (err) {
-        logger_config_1.default.error("[CRON] [SO] Error", { error: err.message });
+    catch (error) {
+        logger_config_1.default.error('Sync cron job failed: ', error);
     }
     finally {
-        soSyncRunning = false;
-    }
-}
-// cron.schedule("0,20,40 * * * *", runSOSync);  // every 20 min at :00, :20, :40
-// ─── Every 20 min — Purchase Orders (staging + sync) ──────────────────────
-// PO at :07, :27, :47 — 7-min offset from SO to avoid API overlap.
-// Governance per PO: Stocking ~42 units, Dropship ~77 units (RESTlet limit 5,000)
-// Batches: 50 stocking + 20 dropship per cron run, 5 parallel workers
-let poSyncRunning = false;
-// cron.schedule("7,27,47 * * * *", async () => {
-//     if (poSyncRunning) {
-//         log.warn("[CRON] [PO] Skipping — previous sync still running");
-//         return;
-//     }
-//     poSyncRunning = true;
-//     try {
-//         log.info("[CRON] [PO] Step 1 — Staging purchase orders...");
-//         await withTimeout(() => stagePurchaseOrders(), "PO-Stage");
-//         log.info("[CRON] [PO] Step 2 — Pushing to NetSuite ERP...");
-//         await withTimeout(() => syncPurchaseOrdersToNetsuite(), "PO-Sync");
-//     } catch (err: any) {
-//         log.error("[CRON] [PO] Error", { error: err.message });
-//     } finally {
-//         poSyncRunning = false;
-//     }
-// });
-// ─── Every 20 min — Bill sync offset from PO ─────────────────────────────
-// SO at :00/:30 → PO at :07/:27/:47 → Bill at :14/:34/:54
-// 7-min gap between each job. Bills depend on PO being synced first.
-let billSyncRunning = false;
-// cron.schedule("14,34,54 * * * *", async () => {
-//     if (billSyncRunning) {
-//         log.warn("[CRON] [BILL] Skipping — previous sync still running");
-//         return;
-//     }
-//     billSyncRunning = true;
-//     try {
-//         log.info("[CRON] [BILL] Step 1 — Staging bills...");
-//         await stageBills();
-//         log.info("[CRON] [BILL] Step 2 — Pushing to NetSuite...");
-//         await syncBillsToNetsuite();
-//     } catch (err: any) {
-//         log.error("[CRON] [BILL] Error", { error: err.message });
-//     } finally {
-//         billSyncRunning = false;
-//     }
-// });
-// ─── Daily 3 AM — Auto-retry permanently failed SOs ─────────────────────────
-node_cron_1.default.schedule("0 3 * * *", async () => {
-    logger_config_1.default.info("[CRON] [SO-RETRY] Resetting permanently failed SOs for retry...");
-    try {
-        const result = await (0, sales_order_sync_1.retryFailedSalesOrders)(true);
-        logger_config_1.default.info(`[CRON] [SO-RETRY] Reset ${result.count} failed orders for retry`);
-    }
-    catch (err) {
-        logger_config_1.default.error("[CRON] [SO-RETRY] Error", { error: err.message });
+        isSyncJobRunning = false;
+        logger_config_1.default.info('Scheduled sync job finished.');
     }
 });
-// ─── Daily 3:15 AM — Auto-retry permanently failed POs ──────────────────────
-node_cron_1.default.schedule("15 3 * * *", async () => {
-    logger_config_1.default.info("[CRON] [PO-RETRY] Resetting permanently failed POs for retry...");
-    try {
-        const result = await (0, po_sync_1.retryFailedPurchaseOrders)(true);
-        logger_config_1.default.info(`[CRON] [PO-RETRY] Reset ${result.count} failed POs for retry`);
-    }
-    catch (err) {
-        logger_config_1.default.error("[CRON] [PO-RETRY] Error", { error: err.message });
-    }
-});
-// ─── Daily 3:30 AM — Auto-retry permanently failed Bills ────────────────
-// cron.schedule("30 3 * * *", async () => {
-//     log.info("[CRON] [BILL-RETRY] Resetting permanently failed bills for retry...");
-//     try {
-//         const result = await retryFailedBills(true);
-//         log.info(`[CRON] [BILL-RETRY] Reset ${result.count} failed bills for retry`);
-//     } catch (err: any) {
-//         log.error("[CRON] [BILL-RETRY] Error", { error: err.message });
-//     }
-// });
-// ─── Every 30 mins — Item Sync (Phase 1 + Phase 2 chained) ──────────────────
-// Phase 1: SuiteQL bulk fetch (5 parallel workers, 5000/page → ~12-16s for 96k)
-// Phase 2: Sublists — only runs when Phase 1 pulled new/updated items
-// Incremental runs are near-instant — safe to run every 30 min.
-let itemSyncRunning = false;
-// cron.schedule("10,35 * * * *", async () => {
-//     if (itemSyncRunning) {
-//         log.warn("[CRON] [ITEM] Skipping — previous sync still running");
-//         return;
-//     }
-//     itemSyncRunning = true;
-//     try {
-//         log.info("[CRON] [ITEM] Syncing items...");
-//         const result = await runItemFullSync();
-//         log.info(`[CRON] [ITEM] Done. Pulled: ${result.totalPulled}, inserted: ${result.inserted}, updated: ${result.updated}, incremental: ${result.incremental}`);
-//     } catch (err: any) {
-//         log.error("[CRON] [ITEM] Error", { error: err.message });
-//     } finally {
-//         itemSyncRunning = false;
-//     }
-// });
 // ═══════════════════════════════════════════════════════════════════════════════
 // GRACEFUL SHUTDOWN
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -272,13 +214,13 @@ async function gracefulShutdown(signal) {
     (0, concurrency_config_1.drainQueue)();
     // 3. Wait for in-flight sync jobs to finish (up to 30s)
     const deadline = Date.now() + 30000;
-    while ((soSyncRunning || poSyncRunning) && Date.now() < deadline) {
-        logger_config_1.default.info(`[SHUTDOWN] Waiting for in-flight syncs... SO=${soSyncRunning}, PO=${poSyncRunning}`);
-        await new Promise(r => setTimeout(r, 2000));
-    }
-    if (soSyncRunning || poSyncRunning) {
-        logger_config_1.default.warn("[SHUTDOWN] Timed out waiting for syncs — forcing exit");
-    }
+    // while ((soSyncRunning || poSyncRunning) && Date.now() < deadline) {
+    //     log.info(`[SHUTDOWN] Waiting for in-flight syncs... SO=${soSyncRunning}, PO=${poSyncRunning}`);
+    //     await new Promise(r => setTimeout(r, 2_000));
+    // }
+    // if (soSyncRunning || poSyncRunning) {
+    //     log.warn("[SHUTDOWN] Timed out waiting for syncs — forcing exit");
+    // }
     logger_config_1.default.info("[SHUTDOWN] Done. Bye.");
     process.exit(0);
 }

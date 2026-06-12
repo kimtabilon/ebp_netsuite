@@ -1,12 +1,12 @@
 import mongoose from "mongoose";
 import { getDb } from "../config/mongdodb.config";
-import { postToNetsuite } from "./netsuite.client";
+import { postToNetsuite, postBatchToNetsuiteForSO } from "./netsuite.client";
 import { SYNC_MODE_SO as SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
 import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
 
 const PARALLEL_WORKERS = 5;
-const BATCH_LIMIT      = 500;
+const BATCH_LIMIT = 500;
 
 /** Serialize RESTlet calls per marketplace order id — avoids NetSuite RCRD_HAS_BEEN_CHANGED when workers hit the same SO. */
 const soSyncTailByRef = new Map<string, Promise<unknown>>();
@@ -28,15 +28,15 @@ function runSalesOrderNetSuiteSyncSerialized<T>(otherrefnum: string, task: () =>
 // "skipped"        → SO already exists, action was "skip"    (success)
 
 // Results we consider fully resolved and should never re-queue
-const RESOLVED_RESULTS = ["created", "updated", "header_updated", "no_items"];
+const RESOLVED_RESULTS = ["created", "updated", "header_updated"];
 
 // ═════════════════════════════════════════════════════════════════════════════
 // MAIN EXPORT
 // ═════════════════════════════════════════════════════════════════════════════
 export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     log.info(`[NS SO Sync] Starting — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, stopOnError: ${STOP_ON_ERROR}`);
-
-    const ns_db      = await getDb("netsuite");
+    return
+    const ns_db = await getDb("netsuite");
     const collection = ns_db.collection("suite_sales_order");
 
     // ── Build filter ─────────────────────────────────────────────────────────
@@ -46,12 +46,12 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     const filter = SYNC_MODE === "update"
         ? {
             ns_synced: { $exists: false }
-          }
+        }
         : {
             ns_synced: { $exists: false }
-          };
+        };
 
-          console.log("Fileter: " , filter);
+    console.log("Fileter: ", filter);
 
     const orders = await collection.find(filter).limit(BATCH_LIMIT).toArray();
 
@@ -68,27 +68,27 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     }
 
 
-    console.log("Order:   " , orders);
+    console.log("Order:   ", orders);
 
     // ── Parallel worker pool ─────────────────────────────────────────────────
-    let sent    = 0;
-    let errors  = 0;
+    let sent = 0;
+    let errors = 0;
     let skipped = 0;
     const results: any[] = [];
     let index = 0;
 
     async function worker() {
         while (index < orders.length) {
-            const i     = index++;
+            const i = index++;
             const order = orders[i];
-            const t0    = Date.now();
+            const t0 = Date.now();
 
-            const entry  = await runSalesOrderNetSuiteSyncSerialized(order.otherrefnum, () =>
+            const entry = await runSalesOrderNetSuiteSyncSerialized(order.otherrefnum, () =>
                 syncOneOrder(collection, order)
             );
             const elapsed = Date.now() - t0;
-            entry.ms      = elapsed;
-            results[i]    = entry;
+            entry.ms = elapsed;
+            results[i] = entry;
 
             const action = entry.action || "";
             if (["no_items", "skipped", "header_updated"].includes(action)) skipped++;
@@ -104,9 +104,9 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
     );
 
     const times = results.filter((r: any) => r?.ms).map((r: any) => r.ms);
-    const avg   = times.length > 0 ? Math.round(times.reduce((a: number, b: number) => a + b, 0) / times.length) : 0;
-    const max   = times.length > 0 ? Math.max(...times) : 0;
-    const min   = times.length > 0 ? Math.min(...times) : 0;
+    const avg = times.length > 0 ? Math.round(times.reduce((a: number, b: number) => a + b, 0) / times.length) : 0;
+    const max = times.length > 0 ? Math.max(...times) : 0;
+    const min = times.length > 0 ? Math.min(...times) : 0;
 
     log.info(
         `[NS SO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}` +
@@ -122,7 +122,7 @@ export const syncSalesOrdersToNetsuite = async (): Promise<any[]> => {
  * Same pipeline as GET /sync-so for one staged document: validate → POST SO RESTlet → mark Mongo.
  * @param directNetSuiteCall  true = single `postToNetsuite` (sync-so-one); false = via concurrency slot (batch sync-so)
  */
-async function syncOneOrder(collection: any, order: any, directNetSuiteCall = true): Promise<any> {
+export async function syncOneOrder(collection: any, order: any, directNetSuiteCall = true): Promise<any> {
     const ref = order.otherrefnum;
 
     // ── Guard: empty items array caught before RESTlet call ──────────────────
@@ -141,17 +141,17 @@ async function syncOneOrder(collection: any, order: any, directNetSuiteCall = tr
     }
 
     const payload = {
-        action:              SYNC_MODE,
-        otherrefnum:         ref,
-        trandate:            order.trandate,
-        store_type:          order.store_type || "amazon",
-        order_status:        order.order_status        || "",
+        action: SYNC_MODE,
+        otherrefnum: ref,
+        trandate: order.trandate,
+        store_type: order.store_type || "amazon",
+        order_status: order.order_status || "",
         fulfillment_channel: order.fulfillment_channel || "",
-        ship_date:           order.ship_date           || null,
-        items:               order.items,
-        shipping_address:    order.shipping_address    || null,
+        ship_date: order.ship_date || null,
+        items: order.items,
+        shipping_address: order.shipping_address || null,
         // NetSuite RESTlet: emit EBP_SO_* audit steps in Script Execution Log (set false to reduce volume).
-        ebp_diagnostic:      true,
+        ebp_diagnostic: true,
     };
 
     // ── Call the RESTlet ─────────────────────────────────────────────────────
@@ -190,12 +190,12 @@ async function syncOneOrder(collection: any, order: any, directNetSuiteCall = tr
         return { otherrefnum: ref, ...result };
     }
 
-    // no_items — create mode and no SKUs exist in NS; don't create empty SO
+    // no_items — create mode and no SKUs exist in NS; treat as failure for manual SKU check
     if (result.success === true && result.action === "no_items") {
-        await markResolved(collection, order, "no_items",
-            `No valid SKUs in NS: ${result.skipped ? result.skipped.join(", ") : result.skus_attempted || "unknown"}`);
-        log.info(`[NS SO Sync] No valid items (create skipped): ${ref}`);
-        return { otherrefnum: ref, success: true, action: "no_items" };
+        const errorMsg = `No valid SKUs in NS: ${result.skipped ? result.skipped.join(", ") : result.skus_attempted || "unknown"}`;
+        await markFailed(collection, order, errorMsg);
+        log.info(`[NS SO Sync] No valid items (create skipped): ${ref} → Treated as FAILURE`);
+        return { otherrefnum: ref, success: false, action: "no_items", error: errorMsg };
     }
 
     // skipped — SO already existed and action was "skip"
@@ -205,9 +205,17 @@ async function syncOneOrder(collection: any, order: any, directNetSuiteCall = tr
         return { otherrefnum: ref, ...result };
     }
 
-    // RESTlet returned success:false — real error, mark failed for retry
+    // RESTlet returned success:false — check if it's a "False Negative" (order exists but update failed)
     if (result.success === false) {
         const errMsg = result.error || "Unknown RESTlet error";
+        const recoveryId = result.existingId || result.internalId;
+
+        if (recoveryId) {
+            log.warn(`[NS SO Sync] Update failed for ${ref}, but order exists in NetSuite (ID: ${recoveryId}). Marking as SYNCED with warning.`);
+            await markResolved(collection, order, "updated_with_errors", `Order exists in NetSuite but update failed: ${errMsg}`);
+            return { otherrefnum: ref, success: true, action: "updated_with_errors", internalId: recoveryId, error: errMsg };
+        }
+
         log.error(`[NS SO Sync] Failed: ${ref} → ${errMsg}`);
         await markFailed(collection, order, errMsg);
         return { otherrefnum: ref, success: false, error: errMsg };
@@ -367,26 +375,26 @@ async function markResolved(
     note?: string
 ) {
     const setFields: any = {
-        ns_synced:    true,
+        ns_synced: true,
         ns_synced_at: new Date(),
-        ns_result:    action,
+        ns_result: action,
     };
 
     // Preserve a human-readable note for non-full-sync outcomes
     if (note) {
-        setFields.ns_note     = note;
-        setFields.ns_note_at  = new Date();
+        setFields.ns_note = note;
+        setFields.ns_note_at = new Date();
     }
 
     await collection.updateOne(
         { _id: order._id },
         {
-            $set:   setFields,
+            $set: setFields,
             $unset: {
-                ns_error:       "",
-                ns_error_at:    "",
+                ns_error: "",
+                ns_error_at: "",
                 ns_retry_count: "",
-                ns_failed:      "",
+                ns_failed: "",
             }
         }
     );
@@ -397,13 +405,14 @@ async function markResolved(
  * After MAX_RETRIES, sets ns_failed: true to stop automatic retries.
  */
 async function markFailed(collection: any, order: any, error: any) {
-    const retryCount       = (order.ns_retry_count || 0) + 1;
-    const permanentlyFailed = true; //retryCount >= MAX_RETRIES;
+    const retryCount = (order.ns_retry_count || 0) + 1;
+    // You can adjust MAX_RETRIES in config. currently it marks as failed immediately if permanentlyFailed is true
+    const permanentlyFailed = retryCount >= MAX_RETRIES;
 
     const setFields: any = {
-        ns_synced:      false,
-        ns_error:       typeof error === "string" ? error : JSON.stringify(error),
-        ns_error_at:    new Date(),
+        ns_synced: false,
+        ns_error: typeof error === "string" ? error : JSON.stringify(error),
+        ns_error_at: new Date(),
         ns_retry_count: retryCount,
     };
 
@@ -414,7 +423,18 @@ async function markFailed(collection: any, order: any, error: any) {
         );
     }
 
-    await collection.updateOne({ _id: order._id }, { $set: setFields });
+    await collection.updateOne(
+        { _id: order._id },
+        {
+            $set: setFields,
+            $unset: {
+                ns_result: "",
+                ns_note: "",
+                ns_note_at: "",
+                ns_synced_at: "",
+            }
+        }
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -463,21 +483,11 @@ async function syncSerial(collection: any, orders: any[]): Promise<any[]> {
 // RETRY HELPERS
 // ═════════════════════════════════════════════════════════════════════════════
 
-/**
- * Reset failed orders so they get picked up on the next sync run.
- *
- * resetAll = false  →  only non-permanently-failed orders (ns_failed not set)
- * resetAll = true   →  also resets permanently failed orders (ns_failed: true)
- *
- * Does NOT reset "no_items" or "header_updated" orders because those are
- * resolved correctly — the SKUs simply don't exist in NetSuite.
- * To force-reset those, pass resetNoItems = true.
- */
 export const retryFailedSalesOrders = async (
-    resetAll     = false,
+    resetAll = false,
     resetNoItems = false
 ): Promise<any> => {
-    const ns_db      = await getDb("netsuite");
+    const ns_db = await getDb("netsuite");
     const collection = ns_db.collection("suite_sales_order");
 
     // Build the filter
@@ -508,31 +518,31 @@ export const retryFailedSalesOrders = async (
     const result = await collection.updateMany(
         { _id: { $in: failedOrders.map((o: any) => o._id) } },
         {
-            $set:   { ns_synced: false },
+            $set: { ns_synced: false },
             $unset: {
-                ns_error:       "",
-                ns_error_at:    "",
+                ns_error: "",
+                ns_error_at: "",
                 ns_retry_count: "",
-                ns_failed:      "",
-                ns_result:      "",
-                ns_note:        "",
-                ns_note_at:     "",
+                ns_failed: "",
+                ns_result: "",
+                ns_note: "",
+                ns_note_at: "",
             }
         }
     );
 
     const orderList = failedOrders.map((o: any) => ({
-        otherrefnum:   o.otherrefnum,
-        previousResult: o.ns_result   || null,
-        previousError: o.ns_error     || null,
-        retryCount:    o.ns_retry_count || 0,
+        otherrefnum: o.otherrefnum,
+        previousResult: o.ns_result || null,
+        previousError: o.ns_error || null,
+        retryCount: o.ns_retry_count || 0,
     }));
 
     log.info(`[NS SO Sync] Reset ${result.modifiedCount} orders for retry.`);
     return {
         message: `Reset ${result.modifiedCount} orders for retry.`,
-        count:   result.modifiedCount,
-        orders:  orderList,
+        count: result.modifiedCount,
+        orders: orderList,
     };
 };
 
@@ -542,4 +552,87 @@ export const retryFailedSalesOrders = async (
  */
 export const retryUnmappedSalesOrders = async (): Promise<any> => {
     return retryFailedSalesOrders(false, true);
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DUMMY SYNC 
+// ═════════════════════════════════════════════════════════════════════════════
+
+export const syncDummySalesOrdersToNetsuite = async (): Promise<any[]> => {
+    log.info(`[NS SO Sync Dummy] Starting — mode: ${SYNC_MODE}, concurrency: dynamic via withConcurrency`);
+
+    const ns_db = await getDb("netsuite");
+    const collection = ns_db.collection("suite_sales_order");
+
+    const filter = { $or: [{ ns_synced: { $exists: false, } }] };
+
+
+    const totalToProcess = await collection.countDocuments(filter);
+    log.info(`[NS SO Sync Dummy] Found ${totalToProcess} dummy orders to process${TEST_MODE ? " (TEST MODE)" : ""}`);
+
+    if (totalToProcess === 0) {
+        log.info("[NS SO Sync Dummy] No orders to process. Skipping.");
+        return [];
+    }
+
+    const orders = await collection.find(filter).toArray();
+
+    let sent = 0;
+    let errors = 0;
+    let skipped = 0;
+    let processedCount = 0;
+    const results: any[] = [];
+    let index = 0;
+
+    // Parallel worker logic using a materialized array to avoid cursor/session reuse.
+    const workers = Array.from({ length: Math.min(5, orders.length) }, async () => {
+        while (true) {
+            const i = index++;
+            if (i >= orders.length) break;
+            const order = orders[i];
+
+            processedCount++;
+            const t0 = Date.now();
+
+            if (processedCount % 100 === 0 || processedCount === 1) {
+                log.info(`[NS SO Sync Dummy] Progress: ${processedCount}/${totalToProcess} (${Math.round((processedCount / totalToProcess) * 100)}%)`);
+            }
+
+            // directNetSuiteCall = false ensures we use withConcurrency slots
+            const entry = await runSalesOrderNetSuiteSyncSerialized(order.otherrefnum, () =>
+                syncOneOrder(collection, order, false)
+            );
+
+            const elapsed = Date.now() - t0;
+            entry.ms = elapsed;
+            results.push(entry);
+
+            const action = entry.action || "";
+            if (["no_items", "skipped", "header_updated"].includes(action)) skipped++;
+            else if (entry.success === false) errors++;
+            else sent++;
+
+            if (TEST_MODE && sent >= 1) {
+                log.info("[NS SO Sync Dummy] TEST_MODE — stopping after first success.");
+                break;
+            }
+            if (STOP_ON_ERROR && entry.success === false) {
+                log.error("[NS SO Sync Dummy] STOP_ON_ERROR — halting after failure.");
+                break;
+            }
+        }
+    });
+
+    await Promise.all(workers);
+
+    const times = results.filter((r: any) => r?.ms).map((r: any) => r.ms);
+    const avg = times.length > 0 ? Math.round(times.reduce((a: number, b: number) => a + b, 0) / times.length) : 0;
+    const max = times.length > 0 ? Math.max(...times) : 0;
+    const min = times.length > 0 ? Math.min(...times) : 0;
+
+    log.info(
+        `[NS SO Sync Dummy] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${totalToProcess}` +
+        ` | timing: avg=${avg}ms, min=${min}ms, max=${max}ms`
+    );
+    return results;
 };

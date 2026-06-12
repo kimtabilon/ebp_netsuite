@@ -41,10 +41,11 @@ import {
     ITEM_RECEIPT_LIST_DEFAULT_LIMIT,
     ITEM_RECEIPT_LIST_ABS_MAX,
 } from "../services/netsuite.rest.client";
-import { persistRestInventoryItemRows, NS_REST_INVENTORY_ITEM_DUMP_COLLECTION } from "../services/inventory_item.rest_dump";
-import { persistRestClassificationRows, NS_REST_CLASSIFICATION_DUMP_COLLECTION } from "../services/classification.rest_dump";
-import { persistRestItemFulfillmentRows, NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION } from "../services/item_fulfillment.rest_dump";
-import { persistRestItemReceiptRows, NS_REST_ITEM_RECEIPT_DUMP_COLLECTION } from "../services/item_receipt.rest_dump";
+import axios from "axios";
+import { persistRestInventoryItemRows, NS_REST_INVENTORY_ITEM_DUMP_COLLECTION, NS_REST_INVENTORY_ITEM_DUMP_COLLECTION_DUMMY } from "../services/inventory_item.rest_dump";
+import { persistRestClassificationRows, NS_REST_CLASSIFICATION_DUMP_COLLECTION, NS_REST_CLASSIFICATION_DUMP_COLLECTION_DUMMY } from "../services/classification.rest_dump";
+import { persistRestItemFulfillmentRows, NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION, NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION_DUMMY } from "../services/item_fulfillment.rest_dump";
+import { persistRestItemReceiptRows, NS_REST_ITEM_RECEIPT_DUMP_COLLECTION, NS_REST_ITEM_RECEIPT_DUMP_COLLECTION_DUMMY } from "../services/item_receipt.rest_dump";
 import type { BaselineCompareVariant } from "../config/ns_baseline_compare.config";
 import { runNsRestCompareBaselineBatch, runNsRestCompareBatch, parseCompareFlag } from "../services/ns_rest_compare.service";
 
@@ -83,7 +84,7 @@ function enrichPersistResult(
 
 type PersistFn = (
     items: any[],
-    options: { save: boolean; queryContext?: Record<string, unknown> }
+    options: { save: boolean; queryContext?: Record<string, unknown>; collection?: string }
 ) => Promise<{ saved: boolean; collection: string; upserted: number; skipped: number; errors: number }>;
 
 type RestRecordRouteConfig = {
@@ -104,6 +105,8 @@ type RestRecordRouteConfig = {
         maxRecords?: number;
         pageSize?: number;
         untilExhausted?: boolean;
+        offset?: number;
+        onBatch?: (batch: any[]) => Promise<void>;
     }) => Promise<any[]>;
     hydrateFromListRows: (listItems: any[], expandSubResources?: string) => Promise<any[]>;
     extractIdFromListItem: (item: any) => string | null;
@@ -115,6 +118,10 @@ type RestRecordRouteConfig = {
     /** Key in `NS_REST_COMPARE_FIELD_PATHS` (used when comparing against REST dump only) */
     recordTypeKey: string;
     dumpCollection: string;
+    /** Collection for parallel dummy dump */
+    dummyDumpCollection?: string;
+    /** Express path for dummy dump, e.g. /inventory-item-dummy-dump */
+    dummyDumpPath?: string;
     /** When set, `compare=true` diffs against this operational collection instead of the dump `payload`. */
     compareBaselineVariant?: BaselineCompareVariant;
 };
@@ -151,6 +158,8 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
         const fetchAll = req.query.fetchAll === "true";
         const persistDb = parsePersistDbFlag(req);
         const compare = parseCompareFlag(req);
+        const rawOffset = req.query.offset != null ? parseInt(String(req.query.offset), 10) : 0;
+        const currentOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
 
         try {
             if (fetchAll) {
@@ -171,15 +180,38 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                         (pageSize != null ? `, pageSize=${pageSize}` : "")
                 );
 
+                const targetCollection = req.query.dummy === "true" ? cfg.dummyDumpCollection : undefined;
+
                 const allRecords = await cfg.fetchAllFn({
                     q: req.query.q,
                     expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
                     maxRecords: untilExhausted ? undefined : maxRecords,
                     pageSize,
                     untilExhausted,
+                    offset: currentOffset,
+                    onBatch: async (batch) => {
+                        if (persistDb) {
+                            await cfg.persistItems(batch, {
+                                save: true,
+                                collection: targetCollection,
+                                queryContext: {
+                                    mode: "fetchAll_incremental",
+                                    maxRecords,
+                                    untilExhausted,
+                                    pageSize: pageSize ?? null,
+                                    q: req.query.q ?? null,
+                                    dbPayloadSource: "per_id_get",
+                                },
+                            });
+                        }
+                    },
                 });
+
+                // Final persist call only if persistDb is true and we want to ensure everything is saved 
+                // (though onBatch handles it now, this keeps compatibility for return values)
                 const persistResult = await cfg.persistItems(allRecords, {
                     save: persistDb,
+                    collection: targetCollection,
                     queryContext: {
                         mode: "fetchAll",
                         maxRecords,
@@ -227,8 +259,7 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                 ? Math.min(Math.max(1, rawListLimit), cfg.listAbsMax)
                 : cfg.listDefaultLimit;
 
-            const rawOffset = req.query.offset != null ? parseInt(String(req.query.offset), 10) : 0;
-            const listOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+            const listOffset = currentOffset;
 
             const expandOnDetail = req.query.expandItems === "true" ? "item" : undefined;
             const wantDetails = restListWantDetails(req.query);
@@ -254,8 +285,10 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                         );
                         rowsForPersist = await cfg.hydrateFromListRows(listOnly, expandOnDetail);
                     }
+                    const targetCollection = req.query.dummy === "true" ? cfg.dummyDumpCollection : undefined;
                     const persistResult = await cfg.persistItems(rowsForPersist, {
                         save: persistDb,
+                        collection: targetCollection,
                         queryContext: {
                             mode: "list_only_async",
                             limit: listLimit,
@@ -293,8 +326,10 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     );
                 }
                 const items = await cfg.hydrateFromListRows(listItems, expandOnDetail);
+                const targetCollection = req.query.dummy === "true" ? cfg.dummyDumpCollection : undefined;
                 const persistResult = await cfg.persistItems(items, {
                     save: persistDb,
+                    collection: targetCollection,
                     queryContext: {
                         mode: "list_details_async",
                         limit: listLimit,
@@ -346,8 +381,10 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                     );
                     rowsForPersist = await cfg.hydrateFromListRows(listOnly, expandOnDetail);
                 }
+                const targetCollection = req.query.dummy === "true" ? cfg.dummyDumpCollection : undefined;
                 const persistResult = await cfg.persistItems(rowsForPersist, {
                     save: persistDb,
+                    collection: targetCollection,
                     queryContext: {
                         mode: "list_only",
                         limit: listLimit,
@@ -384,8 +421,10 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                 );
             }
             const items = await cfg.hydrateFromListRows(listItems, expandOnDetail);
+            const targetCollection = req.query.dummy === "true" ? cfg.dummyDumpCollection : undefined;
             const persistResult = await cfg.persistItems(items, {
                 save: persistDb,
+                collection: targetCollection,
                 queryContext: {
                     mode: "list_details",
                     limit: listLimit,
@@ -445,8 +484,10 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
                   })
                 : null;
             if (persistDb) {
+                const targetCollection = req.query.dummy === "true" ? cfg.dummyDumpCollection : undefined;
                 const persistResult = await cfg.persistItems([data], {
                     save: true,
+                    collection: targetCollection,
                     queryContext: {
                         mode: "single_record_get",
                         id: String(id),
@@ -468,6 +509,70 @@ function registerRestRecordRoutes(cfg: RestRecordRouteConfig) {
             res.status(500).json({ success: false, error: e.message });
         }
     });
+
+    // ─── Parallel Dummy Dump Worker ──────────────────────────────────────────
+    if (cfg.dummyDumpPath && cfg.dummyDumpCollection) {
+        router.get(cfg.dummyDumpPath, async (req: any, res: any) => {
+            const isTest    = req.query.test === "true";
+            const batchSize  = isTest ? 10 : (parseInt(String(req.query.batchSize  ?? "5000"), 10) || 5000);
+            const batchCount = isTest ?  1 : (parseInt(String(req.query.batchCount ?? "3"),    10) || 3);
+            const pageSize   = isTest ? 10 : (parseInt(String(req.query.pageSize   ?? "1000"), 10) || 1000);
+
+            const BASE_URL = `http://localhost:${process.env.PORT ?? 5002}/api/v4/${cfg.pathSegment}`;
+
+            const mode = isTest ? `TEST (1 batch × 10)` : `FULL (${batchCount} workers × ${batchSize} each)`;
+            log.info(`[${cfg.logLabel}-DUMP] Starting ${mode} dump → ${cfg.dummyDumpCollection}`);
+
+            const baseOffset = parseInt(String(req.query.offset || "0"), 10) || 0;
+            const tasks = Array.from({ length: batchCount }).map((_, i) => {
+                const offset = baseOffset + (i * batchSize);
+                log.info(`[${cfg.logLabel}-DUMP-WORKER] Worker ${i + 1}/${batchCount}: offset=${offset}, maxRecords=${batchSize}, pageSize=${pageSize}`);
+                return axios
+                    .get(BASE_URL, {
+                        params: {
+                            fetchAll:   true,
+                            maxRecords: batchSize,
+                            offset:     offset,
+                            persistDb:  true,
+                            pageSize:   pageSize,
+                            dummy:      "true", // Tells the endpoint to use dummyDumpCollection
+                        },
+                        timeout:          90 * 60 * 1000, // 90 min
+                        maxContentLength: Infinity,
+                        maxBodyLength:    Infinity,
+                    })
+                    .then((r) => ({ worker: i + 1, offset, status: r.status, count: r.data?.count ?? 0, persisted: r.data?.persisted ?? 0 }))
+                    .catch((err) => {
+                        const detail = err?.response?.data || err.message;
+                        log.error(`[${cfg.logLabel}-DUMP-WORKER] Worker ${i + 1} (offset ${offset}) failed:`, detail);
+                        return { worker: i + 1, offset, status: err?.response?.status ?? 0, error: detail, count: 0, persisted: 0 };
+                    });
+            });
+
+            res.status(202).json({
+                success: true,
+                mode,
+                batchCount,
+                batchSize,
+                pageSize,
+                collection: cfg.dummyDumpCollection,
+                message: `${batchCount} worker(s) dispatched. Processing async — monitor logs for [${cfg.logLabel}-DUMP-WORKER] progress.`,
+            });
+
+            try {
+                const results = await Promise.all(tasks);
+                const totalFetched   = results.reduce((s, r) => s + r.count,     0);
+                const totalPersisted = results.reduce((s, r) => s + r.persisted,  0);
+                const errors         = results.filter((r:any) => r.error);
+                log.info(
+                    `[${cfg.logLabel}-DUMP] All workers done — fetched=${totalFetched}, persisted=${totalPersisted}, errors=${errors.length}`,
+                    results
+                );
+            } catch (err: any) {
+                log.error(`[${cfg.logLabel}-DUMP] Unexpected error waiting for workers:`, err?.message || err);
+            }
+        });
+    }
 }
 
 registerRestRecordRoutes({
@@ -485,6 +590,8 @@ registerRestRecordRoutes({
     listAbsMax: INVENTORY_ITEM_LIST_ABS_MAX,
     recordTypeKey: "inventory_item",
     dumpCollection: NS_REST_INVENTORY_ITEM_DUMP_COLLECTION,
+    dummyDumpCollection: NS_REST_INVENTORY_ITEM_DUMP_COLLECTION_DUMMY,
+    dummyDumpPath: "/inventory-item-dummy-dump",
     compareBaselineVariant: "inventory_item_full",
 });
 
@@ -503,6 +610,8 @@ registerRestRecordRoutes({
     listAbsMax: CLASSIFICATION_LIST_ABS_MAX,
     recordTypeKey: "classification",
     dumpCollection: NS_REST_CLASSIFICATION_DUMP_COLLECTION,
+    dummyDumpCollection: NS_REST_CLASSIFICATION_DUMP_COLLECTION_DUMMY,
+    dummyDumpPath: "/classification-dummy-dump",
     compareBaselineVariant: "classification_tree",
 });
 
@@ -521,6 +630,8 @@ registerRestRecordRoutes({
     listAbsMax: ITEM_FULFILLMENT_LIST_ABS_MAX,
     recordTypeKey: "item_fulfillment",
     dumpCollection: NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION,
+    dummyDumpCollection: NS_REST_ITEM_FULFILLMENT_DUMP_COLLECTION_DUMMY,
+    dummyDumpPath: "/item-fulfillment-dummy-dump",
 });
 
 registerRestRecordRoutes({
@@ -538,6 +649,8 @@ registerRestRecordRoutes({
     listAbsMax: ITEM_RECEIPT_LIST_ABS_MAX,
     recordTypeKey: "item_receipt",
     dumpCollection: NS_REST_ITEM_RECEIPT_DUMP_COLLECTION,
+    dummyDumpCollection: NS_REST_ITEM_RECEIPT_DUMP_COLLECTION_DUMMY,
+    dummyDumpPath: "/item-receipt-dummy-dump",
 });
 
 export default router;

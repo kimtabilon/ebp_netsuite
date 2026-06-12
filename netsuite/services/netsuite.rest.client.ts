@@ -20,7 +20,7 @@ export const SALES_ORDER_LIST_ABS_MAX = 1_000;
 export const PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX = 250;
 /** Hard cap on PO fetchAll `maxRecords` */
 export const PURCHASE_ORDER_FETCH_ALL_ABS_MAX = 5_000;
-const PURCHASE_ORDER_FETCH_ALL_PAGE_SIZE = 500;
+const PURCHASE_ORDER_FETCH_ALL_PAGE_SIZE = 100;
 /** Default page size for GET /purchaseOrder list (non-fetchAll) */
 export const PURCHASE_ORDER_LIST_DEFAULT_LIMIT = 200;
 /** Max `limit` query for GET /purchaseOrder list */
@@ -41,7 +41,7 @@ export function nsRestFetchUntilExhaustedCap(): number {
  * Build NetSuite REST API base URL
  * e.g., 9511322_SB1 → 9511322-sb1.suitetalk.api.netsuite.com
  */
-const buildRestApiUrl = (): string => {
+export const buildRestApiUrl = (): string => {
     const accountId = process.env.NS_ACCOUNT_ID;
     if (!accountId) throw new Error("NS_ACCOUNT_ID is not set in .env");
     const accountUrl = accountId.toLowerCase().replace(/_/g, "-");
@@ -51,7 +51,7 @@ const buildRestApiUrl = (): string => {
 /**
  * Build OAuth 1.0a header for NetSuite REST API
  */
-const buildOAuthHeader = (url: string, method: string): string => {
+export const buildOAuthHeader = (url: string, method: string): string => {
     const oauth = new OAuth({
         consumer: {
             key: process.env.NS_CONSUMER_KEY!,
@@ -520,24 +520,38 @@ async function deepFollowSelfLinksOnRecord(record: any, kind: DeepFollowRecordKi
  * Cap (only when deep follow on): NS_REST_DEEP_FOLLOW_MAX_REQUESTS=250
  * Verbose logs for 401/403/404/429 on deep follow: NS_REST_DEEP_FOLLOW_LOG_CLIENT_ERRORS=true
  */
-async function hydrateSalesOrderFollowLinkSubresources(record: any): Promise<any> {
+async function hydrateGenericRestRecordFollowLinkSubresources(
+    record: any,
+    label: string,
+    envKey: string | undefined,
+    defaultKeys: string,
+    options: {
+        deepFollowKind?: DeepFollowRecordKind;
+    } = {}
+): Promise<any> {
     if (record == null || typeof record !== "object") return record;
     if (process.env.NS_REST_FOLLOW_SUBRESOURCE_LINKS === "false") {
         stripNetSuiteLinksDeep(record);
         return record;
     }
 
-    const keys = parseFollowSubresourceKeys(
-        process.env.NS_REST_SO_FOLLOW_LINK_KEYS,
-        "item,shippingAddress,billingAddress"
-    );
+    const keys = parseFollowSubresourceKeys(envKey, defaultKeys);
 
     for (const key of keys) {
         const sub = record[key];
-        if (sub == null || typeof sub !== "object" || Array.isArray(sub)) continue;
+        if (sub == null || typeof sub !== "object" || Array.isArray(sub)) {
+            log.debug(`[NS REST] ${label} hydrate skip "${key}": null/non-object/array`);
+            continue;
+        }
 
         const href = extractSelfLinkHref(sub.links);
-        if (!href) continue;
+        if (!href) {
+            const hasLinks = Array.isArray(sub.links);
+            log.debug(
+                `[NS REST] ${label} hydrate skip "${key}": no self-link href. hasLinks=${hasLinks}, links=${JSON.stringify(sub.links ?? null).slice(0, 200)}`
+            );
+            continue;
+        }
 
         if (
             key === "item" &&
@@ -548,52 +562,36 @@ async function hydrateSalesOrderFollowLinkSubresources(record: any): Promise<any
             continue;
         }
 
+        log.info(`[NS REST] ${label} hydrate "${key}" → GET ${href}`);
+
         try {
-            if (key === "item") {
-                const allRows: any[] = [];
-                let firstPage: any = null;
-                let pageUrl: string | null = href;
-                let pages = 0;
-                while (pageUrl) {
-                    pages++;
-                    if (pages > 10_000) {
-                        log.warn("[NS REST] SO item sublist: stopped at page safety cap (10k)");
-                        break;
-                    }
-                    const data = await nsRestOAuthGetAbsolute(pageUrl);
-                    if (firstPage == null) firstPage = data;
-                    const chunk = normalizeNetsuiteRecordListResponse(data);
-                    allRows.push(...chunk);
-                    if (allRows.length > 500_000) {
-                        log.warn("[NS REST] SO item sublist pagination stopped at safety cap (500k rows)");
-                        break;
-                    }
-                    if (data?.hasMore !== true) break;
-                    const nextHref = extractNextLinkHref(data.links);
-                    if (!nextHref) {
-                        if (chunk.length > 0) {
-                            log.warn("[NS REST] SO item sublist: hasMore=true but no rel=next link");
-                        }
-                        break;
-                    }
-                    pageUrl = nextHref;
-                }
+            const data = await nsRestOAuthGetAbsolute(href);
+            
+            // If the response looks like a NetSuite collection (paged items)
+            if (looksLikeNetSuitePagedItemsWrapper(data)) {
+                const allRows = await collectSublistRowsAfterFirstPage(data, `${label} ${key}`, {
+                    kind: "salesOrder",
+                    rootId: record.id,
+                    requests: 0,
+                    maxRequests: 1000,
+                    cappedLogged: false
+                });
+                log.info(`[NS REST] ${label} hydrate "${key}" → collection, count=${allRows.length}`);
                 record[key] = {
                     ...sub,
-                    ...firstPage,
+                    ...data,
                     items: allRows,
                     hasMore: false,
                     count: allRows.length,
                 };
-                delete record[key].links;
             } else {
-                const data = await nsRestOAuthGetAbsolute(href);
+                log.info(`[NS REST] ${label} hydrate "${key}" → object, keys=[${Object.keys(data ?? {}).join(",")}]`);
                 record[key] = { ...sub, ...data };
-                delete record[key].links;
             }
+            delete record[key].links;
         } catch (err: any) {
             log.warn(
-                `[NS REST] SO follow subresource "${key}" failed:`,
+                `[NS REST] ${label} follow subresource "${key}" failed:`,
                 err?.response?.data ?? err?.message ?? err
             );
             record[key] = {
@@ -605,103 +603,37 @@ async function hydrateSalesOrderFollowLinkSubresources(record: any): Promise<any
         }
     }
 
-    await expandTransactionSublistLineRows(record, "salesOrder");
-    stripNetSuiteLinksUnderTransactionLineItems(record);
-    await deepFollowSelfLinksOnRecord(record, "salesOrder");
+    if (options.deepFollowKind) {
+        await expandTransactionSublistLineRows(record, options.deepFollowKind);
+        stripNetSuiteLinksUnderTransactionLineItems(record);
+        await deepFollowSelfLinksOnRecord(record, options.deepFollowKind);
+    }
     stripNetSuiteLinksDeep(record);
     return record;
 }
 
-async function hydratePurchaseOrderFollowLinkSubresources(record: any): Promise<any> {
-    if (record == null || typeof record !== "object") return record;
-    if (process.env.NS_REST_FOLLOW_SUBRESOURCE_LINKS === "false") {
-        stripNetSuiteLinksDeep(record);
-        return record;
-    }
-
-    const keys = parseFollowSubresourceKeys(
-        process.env.NS_REST_PO_FOLLOW_LINK_KEYS,
-        "item,shippingAddress,billingAddress"
+/**
+ * When GET /salesOrder/{id} returns `item` / `shippingAddress` / `billingAddress` as link shells only,
+ * follow `rel: "self"` GET hrefs and merge bodies onto the record.
+ */
+async function hydrateSalesOrderFollowLinkSubresources(record: any): Promise<any> {
+    return hydrateGenericRestRecordFollowLinkSubresources(
+        record,
+        "SO",
+        process.env.NS_REST_SO_FOLLOW_LINK_KEYS,
+        "item,shippingAddress,billingAddress",
+        { deepFollowKind: "salesOrder" }
     );
+}
 
-    for (const key of keys) {
-        const sub = record[key];
-        if (sub == null || typeof sub !== "object" || Array.isArray(sub)) continue;
-
-        const href = extractSelfLinkHref(sub.links);
-        if (!href) continue;
-
-        if (
-            key === "item" &&
-            Array.isArray(sub.items) &&
-            sub.items.length > 0 &&
-            !lineItemsNeedSublistRefetch(sub.items)
-        ) {
-            continue;
-        }
-
-        try {
-            if (key === "item") {
-                const allRows: any[] = [];
-                let firstPage: any = null;
-                let pageUrl: string | null = href;
-                let pages = 0;
-                while (pageUrl) {
-                    pages++;
-                    if (pages > 10_000) {
-                        log.warn("[NS REST] PO item sublist: stopped at page safety cap (10k)");
-                        break;
-                    }
-                    const data = await nsRestOAuthGetAbsolute(pageUrl);
-                    if (firstPage == null) firstPage = data;
-                    const chunk = normalizeNetsuiteRecordListResponse(data);
-                    allRows.push(...chunk);
-                    if (allRows.length > 500_000) {
-                        log.warn("[NS REST] PO item sublist pagination stopped at safety cap (500k rows)");
-                        break;
-                    }
-                    if (data?.hasMore !== true) break;
-                    const nextHref = extractNextLinkHref(data.links);
-                    if (!nextHref) {
-                        if (chunk.length > 0) {
-                            log.warn("[NS REST] PO item sublist: hasMore=true but no rel=next link");
-                        }
-                        break;
-                    }
-                    pageUrl = nextHref;
-                }
-                record[key] = {
-                    ...sub,
-                    ...firstPage,
-                    items: allRows,
-                    hasMore: false,
-                    count: allRows.length,
-                };
-                delete record[key].links;
-            } else {
-                const data = await nsRestOAuthGetAbsolute(href);
-                record[key] = { ...sub, ...data };
-                delete record[key].links;
-            }
-        } catch (err: any) {
-            log.warn(
-                `[NS REST] PO follow subresource "${key}" failed:`,
-                err?.response?.data ?? err?.message ?? err
-            );
-            record[key] = {
-                ...sub,
-                _followLinkError: err?.response?.data
-                    ? JSON.stringify(err.response.data)
-                    : err?.message || "request_failed",
-            };
-        }
-    }
-
-    await expandTransactionSublistLineRows(record, "purchaseOrder");
-    stripNetSuiteLinksUnderTransactionLineItems(record);
-    await deepFollowSelfLinksOnRecord(record, "purchaseOrder");
-    stripNetSuiteLinksDeep(record);
-    return record;
+async function hydratePurchaseOrderFollowLinkSubresources(record: any): Promise<any> {
+    return hydrateGenericRestRecordFollowLinkSubresources(
+        record,
+        "PO",
+        process.env.NS_REST_PO_FOLLOW_LINK_KEYS,
+        "item,shippingAddress,billingAddress",
+        { deepFollowKind: "purchaseOrder" }
+    );
 }
 
 /**
@@ -1021,12 +953,8 @@ async function hydratePurchaseOrdersWithWorkerPool(
                 try {
                     return await getPurchaseOrder(id, expandSubResources);
                 } catch (err: any) {
-                    log.error(
-                        `[NS REST] Failed to fetch PO ${id} (main GET or uncaught hydration):`,
-                        err?.code ?? "",
-                        `HTTP ${err?.response?.status ?? "?"}`,
-                        err?.response?.data ?? err?.message ?? err
-                    );
+                    const safeErrStr = err?.response?.data ? JSON.stringify(err.response.data) : (err?.message || String(err));
+                    log.error(`[NS REST] Failed to fetch PO ${id} (main GET or uncaught hydration): HTTP ${err?.response?.status ?? "?"} - ${safeErrStr}`);
                     return {
                         _hydrateError: err?.response?.data
                             ? JSON.stringify(err.response.data)
@@ -1107,6 +1035,8 @@ export const fetchAllSalesOrders = async (options: {
     pageSize?: number;
     /** Page until NetSuite has no more rows, up to {@link nsRestFetchUntilExhaustedCap} */
     untilExhausted?: boolean;
+    /** Optional starting offset */
+    offset?: number;
 }): Promise<any[]> => {
     const untilExhausted = options.untilExhausted === true;
     const maxRecords = untilExhausted
@@ -1121,7 +1051,7 @@ export const fetchAllSalesOrders = async (options: {
     );
 
     const allRecords: any[] = [];
-    let offset = 0;
+    let offset = options.offset != null && Number.isFinite(options.offset) ? Math.max(0, options.offset) : 0;
 
     log.info(
         `[NS REST] fetchAllSalesOrders start — maxRecords=${maxRecords}, pageSize=${pageSize}` +
@@ -1186,6 +1116,8 @@ export const fetchAllPurchaseOrders = async (options: {
     maxRecords?: number;
     pageSize?: number;
     untilExhausted?: boolean;
+    offset?: number;
+    onBatch?: (batch: any[]) => Promise<void>;
 }): Promise<any[]> => {
     const untilExhausted = options.untilExhausted === true;
     const maxRecords = untilExhausted
@@ -1394,6 +1326,8 @@ async function fetchAllRestRecordsWithDetails(options: {
     extractId: (item: any) => string | null;
     getRecord: (id: string, expand?: string) => Promise<any>;
     logLabel: string;
+    onBatch?: (batch: any[]) => Promise<void>;
+    offset?: number;
 }): Promise<any[]> {
     const untilExhausted = options.untilExhausted === true;
     const maxRecords = untilExhausted
@@ -1402,7 +1336,7 @@ async function fetchAllRestRecordsWithDetails(options: {
     const pageSize = Math.min(Math.max(1, options.pageSize ?? options.pageSizeDefault), 1_000);
 
     const allRecords: any[] = [];
-    let offset = 0;
+    let offset = options.offset || 0;
 
     log.info(
         `[NS REST] fetchAll${options.logLabel} start — maxRecords=${maxRecords}, pageSize=${pageSize}` +
@@ -1444,6 +1378,14 @@ async function fetchAllRestRecordsWithDetails(options: {
             })
             .filter((r) => r != null) as any[];
         allRecords.push(...batch);
+        
+        if (options.onBatch && batch.length > 0) {
+            try {
+                await options.onBatch(batch);
+            } catch (err: any) {
+                log.error(`[NS REST] fetchAll${options.logLabel} onBatch callback failed:`, err.message);
+            }
+        }
 
         log.info(
             `[NS REST] fetchAll${options.logLabel} page: list=${items.length}, details=${batch.length}, total=${allRecords.length}/${maxRecords}`
@@ -1568,8 +1510,114 @@ export const listInventoryItems = async (options: {
     return listRestRecordDualPath(INVENTORY_ITEM_PATH, INVENTORY_ITEM_PATH_LOWER, options);
 };
 
+/**
+ * After collecting all rows from a sublist collection, expand any link-shell rows
+ * (rows that only have `links` but no real fields) by GETting their self-link href.
+ */
+async function expandSublistLinkShellRows(rows: any[], label: string): Promise<void> {
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        if (!isPlainRestObject(row)) continue;
+
+        // A link shell has no keys other than "links"
+        const nonLinkKeys = Object.keys(row).filter((k) => k !== "links");
+        if (nonLinkKeys.length > 0) continue; // Already has data
+
+        const href = extractSelfLinkHref(row.links);
+        if (!href) continue;
+
+        try {
+            const data = await nsRestOAuthGetAbsolute(href);
+            Object.assign(row, data);
+            delete row.links;
+            log.debug(`[NS REST] ${label} row[${i}] expanded OK`);
+        } catch (err: any) {
+            const status = err?.response?.status;
+            log.warn(`[NS REST] ${label} row[${i}] expand failed (${status}):`, err?.response?.data ?? err?.message);
+            (row as any)._rowExpandError = err?.message || "request_failed";
+        }
+    }
+}
+
+/**
+ * Fetches a known NetSuite sublist collection by constructing the URL directly,
+ * then expands any link-shell rows via per-row GET.
+ * e.g. GET .../inventoryItem/{id}/locations → expand each row
+ */
+async function fetchNsSublistByDirectUrl(
+    recordPath: string,
+    recordId: string,
+    sublistName: string,
+    label: string
+): Promise<any[] | null> {
+    const baseUrl = buildRestApiUrl();
+    const url = `${baseUrl}/${recordPath}/${encodeURIComponent(recordId)}/${sublistName}`;
+    log.info(`[NS REST] ${label} fetching sublist "${sublistName}" → GET ${url}`);
+    try {
+        const data = await nsRestOAuthGetAbsolute(url);
+        if (!data) return null;
+        if (looksLikeNetSuitePagedItemsWrapper(data)) {
+            const ctx: DeepFollowCtx = {
+                kind: "salesOrder",
+                rootId: recordId,
+                requests: 0,
+                maxRequests: 2000,
+                cappedLogged: false,
+            };
+            const allRows = await collectSublistRowsAfterFirstPage(data, `${label} ${sublistName}`, ctx);
+            // Expand each row that is just a link shell
+            await expandSublistLinkShellRows(allRows, `${label} ${sublistName}`);
+            log.info(`[NS REST] ${label} sublist "${sublistName}" → ${allRows.length} rows (expanded)`);
+            return allRows;
+        }
+        // Not a collection — return single item as array
+        return [data];
+    } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 404 || status === 403) {
+            log.debug(`[NS REST] ${label} sublist "${sublistName}" → ${status} (skipped)`);
+        } else {
+            log.warn(`[NS REST] ${label} sublist "${sublistName}" fetch failed:`, err?.response?.data ?? err?.message);
+        }
+        return null;
+    }
+}
+
+
+// Known sublists for inventory items that must be fetched separately
+const INVENTORY_ITEM_SUBLISTS = [
+    "locations",
+    "price",
+    "itemVendor",
+    "subsidiary",
+    "binNumber",
+    "translations",
+    "itemOptions",
+    "custitem1",
+] as const;
+
+async function hydrateInventoryItemFollowLinkSubresources(record: any): Promise<any> {
+    if (!record || typeof record !== "object") return record;
+    const id = String(record.id ?? "").trim();
+    if (!id) return record;
+
+    for (const sublist of INVENTORY_ITEM_SUBLISTS) {
+        const rows = await fetchNsSublistByDirectUrl(INVENTORY_ITEM_PATH, id, sublist, "InventoryItem");
+        if (rows !== null) {
+            record[sublist] = { items: rows, count: rows.length };
+        }
+    }
+
+    // Strip all remaining links from the record (reference fields already have id/refName)
+    stripNetSuiteLinksDeep(record);
+    return record;
+}
+
+
 export const getInventoryItem = async (id: string | number, expandSubResources?: string): Promise<any> => {
-    return getRestRecordDualPath(String(id).trim(), expandSubResources, INVENTORY_ITEM_PATH, INVENTORY_ITEM_PATH_LOWER);
+    const sid = String(id).trim();
+    const data = await getRestRecordDualPath(sid, expandSubResources, INVENTORY_ITEM_PATH, INVENTORY_ITEM_PATH_LOWER);
+    return hydrateInventoryItemFollowLinkSubresources(data);
 };
 
 export async function hydrateInventoryItemsFromListRows(
@@ -1591,6 +1639,8 @@ export const fetchAllInventoryItems = async (options: {
     maxRecords?: number;
     pageSize?: number;
     untilExhausted?: boolean;
+    onBatch?: (batch: any[]) => Promise<void>;
+    offset?: number;
 }): Promise<any[]> => {
     return fetchAllRestRecordsWithDetails({
         q: options.q,
@@ -1598,6 +1648,8 @@ export const fetchAllInventoryItems = async (options: {
         maxRecords: options.maxRecords,
         pageSize: options.pageSize,
         untilExhausted: options.untilExhausted,
+        onBatch: options.onBatch,
+        offset: options.offset,
         defaultMax: INVENTORY_ITEM_FETCH_ALL_DEFAULT_MAX,
         absMax: INVENTORY_ITEM_FETCH_ALL_ABS_MAX,
         pageSizeDefault: INVENTORY_ITEM_FETCH_ALL_PAGE_SIZE,
@@ -1634,8 +1686,14 @@ export const listClassifications = async (options: {
     return listRestRecordWithPath(CLASSIFICATION_PATH, options);
 };
 
+
 export const getClassification = async (id: string | number, expandSubResources?: string): Promise<any> => {
-    return getRestRecordWithPath(String(id).trim(), expandSubResources, CLASSIFICATION_PATH);
+    const sid = String(id).trim();
+    // For Classifications, NetSuite requires expandSubResources=true to see subsidiary/translations
+    const expand = expandSubResources || "true";
+    const data = await getRestRecordWithPath(sid, expand, CLASSIFICATION_PATH);
+    stripNetSuiteLinksDeep(data);
+    return data;
 };
 
 export async function hydrateClassificationsFromListRows(
@@ -1657,6 +1715,8 @@ export const fetchAllClassifications = async (options: {
     maxRecords?: number;
     pageSize?: number;
     untilExhausted?: boolean;
+    onBatch?: (batch: any[]) => Promise<void>;
+    offset?: number;
 }): Promise<any[]> => {
     return fetchAllRestRecordsWithDetails({
         q: options.q,
@@ -1664,6 +1724,8 @@ export const fetchAllClassifications = async (options: {
         maxRecords: options.maxRecords,
         pageSize: options.pageSize,
         untilExhausted: options.untilExhausted,
+        onBatch: options.onBatch,
+        offset: options.offset,
         defaultMax: CLASSIFICATION_FETCH_ALL_DEFAULT_MAX,
         absMax: CLASSIFICATION_FETCH_ALL_ABS_MAX,
         pageSizeDefault: CLASSIFICATION_FETCH_ALL_PAGE_SIZE,
@@ -1678,7 +1740,7 @@ export const fetchAllClassifications = async (options: {
 // ─── Item Fulfillment ───────────────────────────────────────────────────────
 
 export const ITEM_FULFILLMENT_FETCH_ALL_DEFAULT_MAX = 250;
-export const ITEM_FULFILLMENT_FETCH_ALL_ABS_MAX = 5_000;
+export const ITEM_FULFILLMENT_FETCH_ALL_ABS_MAX = 10_000;
 const ITEM_FULFILLMENT_FETCH_ALL_PAGE_SIZE = 500;
 export const ITEM_FULFILLMENT_LIST_DEFAULT_LIMIT = 200;
 export const ITEM_FULFILLMENT_LIST_ABS_MAX = 1_000;
@@ -1700,8 +1762,29 @@ export const listItemFulfillments = async (options: {
     return listRestRecordDualPath(ITEM_FULFILLMENT_PATH, ITEM_FULFILLMENT_PATH_LOWER, options);
 };
 
+// Known sublists for item fulfillments that must be fetched separately
+const ITEM_FULFILLMENT_SUBLISTS = ["item"] as const;
+
+async function hydrateItemFulfillmentFollowLinkSubresources(record: any): Promise<any> {
+    if (!record || typeof record !== "object") return record;
+    const id = String(record.id ?? "").trim();
+    if (!id) return record;
+
+    for (const sublist of ITEM_FULFILLMENT_SUBLISTS) {
+        const rows = await fetchNsSublistByDirectUrl(ITEM_FULFILLMENT_PATH, id, sublist, "ItemFulfillment");
+        if (rows !== null) {
+            record[sublist] = { items: rows, count: rows.length };
+        }
+    }
+
+    stripNetSuiteLinksDeep(record);
+    return record;
+}
+
 export const getItemFulfillment = async (id: string | number, expandSubResources?: string): Promise<any> => {
-    return getRestRecordDualPath(String(id).trim(), expandSubResources, ITEM_FULFILLMENT_PATH, ITEM_FULFILLMENT_PATH_LOWER);
+    const sid = String(id).trim();
+    const data = await getRestRecordDualPath(sid, expandSubResources, ITEM_FULFILLMENT_PATH, ITEM_FULFILLMENT_PATH_LOWER);
+    return hydrateItemFulfillmentFollowLinkSubresources(data);
 };
 
 export async function hydrateItemFulfillmentsFromListRows(
@@ -1723,6 +1806,8 @@ export const fetchAllItemFulfillments = async (options: {
     maxRecords?: number;
     pageSize?: number;
     untilExhausted?: boolean;
+    onBatch?: (batch: any[]) => Promise<void>;
+    offset?: number;
 }): Promise<any[]> => {
     return fetchAllRestRecordsWithDetails({
         q: options.q,
@@ -1730,6 +1815,8 @@ export const fetchAllItemFulfillments = async (options: {
         maxRecords: options.maxRecords,
         pageSize: options.pageSize,
         untilExhausted: options.untilExhausted,
+        onBatch: options.onBatch,
+        offset: options.offset,
         defaultMax: ITEM_FULFILLMENT_FETCH_ALL_DEFAULT_MAX,
         absMax: ITEM_FULFILLMENT_FETCH_ALL_ABS_MAX,
         pageSizeDefault: ITEM_FULFILLMENT_FETCH_ALL_PAGE_SIZE,
@@ -1766,8 +1853,29 @@ export const listItemReceipts = async (options: {
     return listRestRecordDualPath(ITEM_RECEIPT_PATH, ITEM_RECEIPT_PATH_LOWER, options);
 };
 
+// Known sublists for item receipts that must be fetched separately
+const ITEM_RECEIPT_SUBLISTS = ["item"] as const;
+
+async function hydrateItemReceiptFollowLinkSubresources(record: any): Promise<any> {
+    if (!record || typeof record !== "object") return record;
+    const id = String(record.id ?? "").trim();
+    if (!id) return record;
+
+    for (const sublist of ITEM_RECEIPT_SUBLISTS) {
+        const rows = await fetchNsSublistByDirectUrl(ITEM_RECEIPT_PATH, id, sublist, "ItemReceipt");
+        if (rows !== null) {
+            record[sublist] = { items: rows, count: rows.length };
+        }
+    }
+
+    stripNetSuiteLinksDeep(record);
+    return record;
+}
+
 export const getItemReceipt = async (id: string | number, expandSubResources?: string): Promise<any> => {
-    return getRestRecordDualPath(String(id).trim(), expandSubResources, ITEM_RECEIPT_PATH, ITEM_RECEIPT_PATH_LOWER);
+    const sid = String(id).trim();
+    const data = await getRestRecordDualPath(sid, expandSubResources, ITEM_RECEIPT_PATH, ITEM_RECEIPT_PATH_LOWER);
+    return hydrateItemReceiptFollowLinkSubresources(data);
 };
 
 export async function hydrateItemReceiptsFromListRows(
@@ -1789,6 +1897,8 @@ export const fetchAllItemReceipts = async (options: {
     maxRecords?: number;
     pageSize?: number;
     untilExhausted?: boolean;
+    onBatch?: (batch: any[]) => Promise<void>;
+    offset?: number;
 }): Promise<any[]> => {
     return fetchAllRestRecordsWithDetails({
         q: options.q,
@@ -1796,6 +1906,8 @@ export const fetchAllItemReceipts = async (options: {
         maxRecords: options.maxRecords,
         pageSize: options.pageSize,
         untilExhausted: options.untilExhausted,
+        onBatch: options.onBatch,
+        offset: options.offset,
         defaultMax: ITEM_RECEIPT_FETCH_ALL_DEFAULT_MAX,
         absMax: ITEM_RECEIPT_FETCH_ALL_ABS_MAX,
         pageSizeDefault: ITEM_RECEIPT_FETCH_ALL_PAGE_SIZE,
@@ -1806,3 +1918,21 @@ export const fetchAllItemReceipts = async (options: {
         logLabel: "ItemReceipts",
     });
 };
+// ─── Vendor Bill ──────────────────────────────────────────────────────────────
+export const listVendorBills = async (options: {
+    q?: string;
+    limit?: number;
+    offset?: number;
+    expandSubResources?: string;
+}): Promise<any> => {
+    return listRestRecordWithPath("vendorBill", options);
+};
+
+export function normalizeVendorBillListItems(data: any): any[] {
+    return normalizeRestRecordListItems(data);
+}
+
+export function extractVendorBillIdFromListItem(item: any): string | null {
+    const VENDOR_BILL_LINK_RE = /\/(?:vendorBill|vendorbill)\/([^/?#]+)/i;
+    return extractRestRecordIdFromListItem(item, VENDOR_BILL_LINK_RE);
+}

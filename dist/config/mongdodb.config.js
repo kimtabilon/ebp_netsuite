@@ -13,7 +13,9 @@ function mongoClientOptions() {
     // Driver default serverSelectionTimeoutMS is 2000 — too aggressive for remote DBs or cold starts.
     const serverSelectionTimeoutMS = Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS) || 30000;
     const connectTimeoutMS = Number(process.env.MONGO_CONNECT_TIMEOUT_MS) || 30000;
-    return { serverSelectionTimeoutMS, connectTimeoutMS };
+    const socketTimeoutMS = Number(process.env.MONGO_SOCKET_TIMEOUT_MS) || 60000;
+    const maxPoolSize = Number(process.env.MONGO_MAX_POOL_SIZE) || 50;
+    return { serverSelectionTimeoutMS, connectTimeoutMS, socketTimeoutMS, maxPoolSize };
 }
 async function connectMongoBase() {
     if (baseConnection)
