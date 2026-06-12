@@ -27,8 +27,8 @@ export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
 
     log.info("[syncPurchaseOrdersToNetsuite] Fast Sync starting with cursor-based processing...");
 
-    const filter = { po_number: 233175 };
-    // const filter = { $or: [{ ns_synced: null },] };
+
+    const filter = { $or: [{ ns_synced: null }] };
 
     const totalToProcess = await dummyCol.countDocuments(filter);
     log.info(`[syncPurchaseOrdersToNetsuite] Found ${totalToProcess} dummy POs to sync.`);
