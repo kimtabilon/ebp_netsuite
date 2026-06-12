@@ -185,7 +185,7 @@ cron.schedule('0 */2 * * *', async () => {
     }
     log.info('Every 2 hours job executed at: ' + new Date().toISOString());
 });
-
+ 
 // // Job 2: Runs every Saturday at 00:00 (midnight)
 cron.schedule('0 0 * * 6', async () => {
 
