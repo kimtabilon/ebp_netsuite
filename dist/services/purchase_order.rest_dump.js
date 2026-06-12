@@ -9,7 +9,8 @@ const mongdodb_config_1 = require("../config/mongdodb.config");
 const logger_config_1 = __importDefault(require("../config/logger.config"));
 const netsuite_rest_client_1 = require("./netsuite.rest.client");
 /** Mongo collection for raw NetSuite REST purchase order payloads (one document per PO row). */
-exports.NS_REST_PO_DUMP_COLLECTION = "ns_rest_purchase_order_detail_dump";
+// export const NS_REST_PO_DUMP_COLLECTION = "ns_rest_purchase_order_detail_dump";
+exports.NS_REST_PO_DUMP_COLLECTION = "ns_rest_purchase_order_detail_dump_dummy";
 function extractNsIdFromRestPayload(item) {
     if (item == null || typeof item !== "object")
         return null;
@@ -45,7 +46,9 @@ async function persistRestPurchaseOrderItems(items, options) {
     const now = new Date();
     for (const item of items) {
         const nsId = extractNsIdFromRestPayload(item);
+        // log.info(`[NS REST PO dump][DEBUG] Attempting upsert. Extracted nsId: ${nsId}, PO object: ${JSON.stringify(item)}`);
         if (!nsId) {
+            logger_config_1.default.warn(`[NS REST PO dump][DEBUG] Skipping PO object due to missing nsId. PO object: ${nsId},   `);
             base.skipped++;
             continue;
         }
@@ -57,6 +60,7 @@ async function persistRestPurchaseOrderItems(items, options) {
         };
         try {
             await col.replaceOne({ ns_internal_id: nsId }, doc, { upsert: true });
+            logger_config_1.default.info(`[NS REST PO dump][DEBUG] Upserted PO with nsId: ${nsId}`);
             base.upserted++;
         }
         catch (err) {
@@ -65,6 +69,11 @@ async function persistRestPurchaseOrderItems(items, options) {
         }
     }
     base.saved = true;
+    if (base.upserted === 0 && items.length > 0) {
+        base.hint =
+            "No documents upserted — check persist.skipped (missing ns id) or persist.errors (Mongo). Collection: netsuite." +
+                exports.NS_REST_PO_DUMP_COLLECTION;
+    }
     logger_config_1.default.info(`[NS REST PO dump] collection=${exports.NS_REST_PO_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`);
     return base;
 }

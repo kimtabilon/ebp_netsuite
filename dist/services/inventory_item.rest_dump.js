@@ -3,12 +3,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION = void 0;
+exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION_DUMMY = exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION = void 0;
 exports.persistRestInventoryItemRows = persistRestInventoryItemRows;
 const mongdodb_config_1 = require("../config/mongdodb.config");
 const logger_config_1 = __importDefault(require("../config/logger.config"));
 const netsuite_rest_client_1 = require("./netsuite.rest.client");
 exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION = "ns_rest_inventory_item_detail_dump";
+exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION_DUMMY = "ns_rest_inventory_item_detail_dump_dummy";
 function extractNsIdFromRestPayload(item) {
     if (item == null || typeof item !== "object")
         return null;
@@ -21,9 +22,10 @@ function extractNsIdFromRestPayload(item) {
     return (0, netsuite_rest_client_1.extractInventoryItemIdFromListItem)(item);
 }
 async function persistRestInventoryItemRows(items, options) {
+    const targetCollection = options.collection || exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION;
     const base = {
         saved: false,
-        collection: exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION,
+        collection: targetCollection,
         upserted: 0,
         skipped: 0,
         errors: 0,
@@ -36,7 +38,7 @@ async function persistRestInventoryItemRows(items, options) {
         return base;
     }
     const ns_db = await (0, mongdodb_config_1.getDb)("netsuite");
-    const col = ns_db.collection(exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION);
+    const col = ns_db.collection(targetCollection);
     const now = new Date();
     for (const item of items) {
         const nsId = extractNsIdFromRestPayload(item);
@@ -65,6 +67,6 @@ async function persistRestInventoryItemRows(items, options) {
         const keys = sample && typeof sample === "object" ? Object.keys(sample).slice(0, 25) : [];
         logger_config_1.default.warn(`[NS REST inventory item dump] all ${base.skipped} row(s) skipped (no internal id). First row keys: ${keys.join(", ")}`);
     }
-    logger_config_1.default.info(`[NS REST inventory item dump] collection=${exports.NS_REST_INVENTORY_ITEM_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`);
+    logger_config_1.default.info(`[NS REST inventory item dump] collection=${targetCollection} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`);
     return base;
 }

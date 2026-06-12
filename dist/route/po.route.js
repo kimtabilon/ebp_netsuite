@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.flagOnlyInNetSuitePOs = flagOnlyInNetSuitePOs;
 const express_1 = require("express");
 const logger_config_1 = __importDefault(require("../config/logger.config"));
 const mongdodb_config_1 = require("../config/mongdodb.config");
@@ -11,6 +12,7 @@ const po_stage_1 = require("../services/po.stage");
 const netsuite_client_1 = require("../services/netsuite.client");
 const netsuite_rest_client_1 = require("../services/netsuite.rest.client");
 const purchase_order_rest_dump_1 = require("../services/purchase_order.rest_dump");
+const ns_rest_compare_service_1 = require("../services/ns_rest_compare.service");
 // ── Warehouse map with addresses for logging ───────────────────────────────
 const WAREHOUSE_MAP = {
     "MW": { netsuiteName: "California - Chatsworth", address: "21540 Prairie Street, Suite F, Chatsworth CA 91311" },
@@ -96,17 +98,6 @@ router.post("/reset-po-sync", async (_req, res) => {
     }
     catch (e) {
         logger_config_1.default.error("[RESET-PO-SYNC] Error:", e);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-// ─── Retry failed POs ──────────────────────────────────────────────────────
-router.get("/retry-failed-po", async (req, res) => {
-    try {
-        const resetAll = req.query.all === "1" || req.query.all === "true";
-        const result = await (0, po_sync_1.retryFailedPurchaseOrders)(resetAll);
-        res.json({ success: true, ...result });
-    }
-    catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -495,6 +486,28 @@ router.post("/delete-all-po", async (_req, res) => {
         res.status(500).json({ error: e?.response?.data || e.message });
     }
 });
+// ─── Delete Specific IDs ──────────────────────────────────────────────────
+// POST /delete-specific-ids
+// Body: { recordType: "purchaseorder", ids: [123, 456] }
+router.post("/delete-specific-ids", async (req, res) => {
+    const { recordType, ids } = req.body;
+    logger_config_1.default.info(`[DELETE-IDS] POST execute — deleting ${ids?.length} records of type ${recordType}`);
+    if (!recordType || !ids || !Array.isArray(ids)) {
+        return res.status(400).json({ success: false, error: "recordType and ids array are required" });
+    }
+    try {
+        const result = await (0, netsuite_client_2.callCleanup)({
+            action: "delete_ids",
+            recordType,
+            ids
+        });
+        res.json(result);
+    }
+    catch (e) {
+        logger_config_1.default.error("[DELETE-IDS] ERROR", { status: e?.response?.status, data: e?.response?.data, message: e.message });
+        res.status(500).json({ error: e?.response?.data || e.message });
+    }
+});
 // ════════════════════════════════════════════════════════════════════════════
 // NETSUITE REST API - PURCHASE ORDERS
 // ════════════════════════════════════════════════════════════════════════════
@@ -504,60 +517,121 @@ router.post("/delete-all-po", async (_req, res) => {
  *
  * Query: q, limit (default 200, max 1000), offset, expandItems, details (default true),
  * fetchAll, maxRecords, pageSize, persistDb | saveToDb (Mongo always stores full per-id GET when saving)
+ * compare: true — baseline diff vs `suite_purchase_order`; with persistDb=true compare runs by default (opt out: compare=false)
  */
 router.get("/purchaseOrder", async (req, res) => {
     const prefer = req.headers.prefer;
     const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
     const fetchAll = req.query.fetchAll === "true";
     const persistDb = parsePersistDbFlag(req);
+    const compare = (0, ns_rest_compare_service_1.shouldRunBaselineCompareWithPersist)(req, persistDb);
+    const untilExhausted = req.query.untilExhausted === "true";
+    const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
+    const maxRecords = untilExhausted
+        ? (0, netsuite_rest_client_1.nsRestFetchUntilExhaustedCap)()
+        : Number.isFinite(rawMax)
+            ? Math.min(Math.max(1, rawMax), netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_ABS_MAX)
+            : netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX;
+    const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
+    const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1000) : undefined;
+    const rawOffset = req.query.offset != null ? parseInt(String(req.query.offset), 10) : 0;
+    const currentOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
     try {
         if (fetchAll) {
-            const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
-            const maxRecords = Number.isFinite(rawMax)
-                ? Math.min(Math.max(1, rawMax), netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_ABS_MAX)
-                : netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX;
-            const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
-            const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1000) : undefined;
             logger_config_1.default.info(`[PurchaseOrder List] fetchAll — maxRecords=${maxRecords}` +
+                (untilExhausted ? ", untilExhausted=true" : "") +
                 (pageSize != null ? `, pageSize=${pageSize}` : ""));
-            const allRecords = await (0, netsuite_rest_client_1.fetchAllPurchaseOrders)({
-                q: req.query.q,
-                expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
-                maxRecords,
-                pageSize,
-            });
-            const persistResult = await (0, purchase_order_rest_dump_1.persistRestPurchaseOrderItems)(allRecords, {
-                save: persistDb,
-                queryContext: {
-                    mode: "fetchAll",
-                    maxRecords,
-                    pageSize: pageSize ?? null,
-                    q: req.query.q ?? null,
-                    dbPayloadSource: "per_id_get",
-                },
-            });
+            // Fetch and persist each record one by one to avoid data loss
+            let totalFetched = 0;
+            let totalPersisted = 0;
+            let persistErrors = [];
+            let allRecords = [];
+            try {
+                allRecords = await (0, netsuite_rest_client_1.fetchAllPurchaseOrders)({
+                    q: req.query.q,
+                    expandSubResources: req.query.expandItems === "true" ? "true" : undefined,
+                    maxRecords: untilExhausted ? undefined : maxRecords,
+                    pageSize,
+                    untilExhausted,
+                    offset: currentOffset,
+                    onBatch: async (batch) => {
+                        totalFetched += batch.length;
+                        if (persistDb) {
+                            try {
+                                const result = await (0, purchase_order_rest_dump_1.persistRestPurchaseOrderItems)(batch, {
+                                    save: true,
+                                    queryContext: {
+                                        mode: "fetchAll_incremental",
+                                        maxRecords,
+                                        untilExhausted,
+                                        pageSize: pageSize ?? null,
+                                        q: req.query.q ?? null,
+                                        dbPayloadSource: "per_id_get",
+                                    },
+                                });
+                                if (result) {
+                                    totalPersisted += result.upserted;
+                                    if (result.errors > 0)
+                                        persistErrors.push(result);
+                                }
+                            }
+                            catch (err) {
+                                logger_config_1.default.error(`[PO API] Incremental persist failed for batch:`, err);
+                                persistErrors.push({ error: err });
+                            }
+                        }
+                        logger_config_1.default.info(`[PO API] Fetched and persisted ${totalFetched} records so far...`);
+                    },
+                });
+            }
+            catch (err) {
+                logger_config_1.default.error(`[PO API] Error during fetchAll:`, err);
+            }
+            logger_config_1.default.info(`[PO API] fetchAll fetched ${totalFetched} records from NetSuite. Persisted: ${totalPersisted}. Errors: ${persistErrors.length}`);
+            const compareResult = compare
+                ? await (0, ns_rest_compare_service_1.runNsRestCompareBaselineBatch)({
+                    variant: "purchase_order_staged",
+                    items: allRecords,
+                    extractId: netsuite_rest_client_1.extractPurchaseOrderIdFromListItem,
+                    source: {
+                        api: "purchaseOrder",
+                        mode: "fetchAll_streamed",
+                        untilExhausted,
+                        maxRecords,
+                        pageSize: pageSize ?? null,
+                    },
+                })
+                : null;
+            logger_config_1.default.info(`[PO API] runNsRestCompareBaselineBatch result: ${compareResult ? "OK" : "SKIPPED"}`);
             return res.json({
                 success: true,
                 fetchAll: true,
+                untilExhausted,
                 maxRecords,
                 pageSize: pageSize ?? null,
-                count: allRecords.length,
-                items: allRecords,
-                persistDb,
-                persist: persistResult,
-                limits: {
-                    defaultMax: netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX,
-                    absMax: netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_ABS_MAX,
-                },
+                count: totalFetched,
+                persisted: totalPersisted,
+                persistErrors: persistErrors.length,
+                persistErrorDetails: persistErrors.length > 0 ? persistErrors.slice(0, 5) : undefined,
+                compare,
+                compareResult,
+                limits: untilExhausted
+                    ? {
+                        untilExhaustedCap: (0, netsuite_rest_client_1.nsRestFetchUntilExhaustedCap)(),
+                        note: "Pages until NetSuite ends the list or cap is hit (env NS_REST_FETCH_UNTIL_EXHAUSTED_CAP).",
+                    }
+                    : {
+                        defaultMax: netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX,
+                        absMax: netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_ABS_MAX,
+                    },
             });
         }
         const rawListLimit = req.query.limit != null ? parseInt(String(req.query.limit), 10) : NaN;
         const listLimit = Number.isFinite(rawListLimit)
             ? Math.min(Math.max(1, rawListLimit), netsuite_rest_client_1.PURCHASE_ORDER_LIST_ABS_MAX)
             : netsuite_rest_client_1.PURCHASE_ORDER_LIST_DEFAULT_LIMIT;
-        const rawOffset = req.query.offset != null ? parseInt(String(req.query.offset), 10) : 0;
-        const listOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
-        const expandOnDetail = req.query.expandItems === "true" ? "item" : undefined;
+        const listOffset = currentOffset;
+        const expandOnDetail = req.query.expandItems === "true" ? "true" : undefined;
         const wantDetails = (0, netsuite_rest_client_1.restListWantDetails)(req.query);
         const listOptions = {
             q: req.query.q,
@@ -573,8 +647,8 @@ router.get("/purchaseOrder", async (req, res) => {
             if (!wantDetails) {
                 const listOnly = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
                 let rowsForPersist = listOnly;
-                if (persistDb && listOnly.length > 0) {
-                    logger_config_1.default.info(`[PurchaseOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`);
+                if ((persistDb || compare) && listOnly.length > 0) {
+                    logger_config_1.default.info(`[PurchaseOrder List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`);
                     rowsForPersist = await (0, netsuite_rest_client_1.hydratePurchaseOrdersFromListRows)(listOnly, expandOnDetail);
                 }
                 const persistResult = await (0, purchase_order_rest_dump_1.persistRestPurchaseOrderItems)(rowsForPersist, {
@@ -587,6 +661,19 @@ router.get("/purchaseOrder", async (req, res) => {
                         dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                     },
                 });
+                const compareResult = compare
+                    ? await (0, ns_rest_compare_service_1.runNsRestCompareBaselineBatch)({
+                        variant: "purchase_order_staged",
+                        items: rowsForPersist,
+                        extractId: netsuite_rest_client_1.extractPurchaseOrderIdFromListItem,
+                        source: {
+                            api: "purchaseOrder",
+                            mode: "list_only_async",
+                            limit: listLimit,
+                            offset: listOffset,
+                        },
+                    })
+                    : null;
                 return res.status(202).setHeader("Preference-Applied", "respond-async").json({
                     success: true,
                     async: true,
@@ -597,6 +684,8 @@ router.get("/purchaseOrder", async (req, res) => {
                     offset: listOffset,
                     persistDb,
                     persist: persistResult,
+                    compare,
+                    compareResult,
                 });
             }
             const listItems = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
@@ -614,6 +703,19 @@ router.get("/purchaseOrder", async (req, res) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
+            const compareResult = compare
+                ? await (0, ns_rest_compare_service_1.runNsRestCompareBaselineBatch)({
+                    variant: "purchase_order_staged",
+                    items,
+                    extractId: netsuite_rest_client_1.extractPurchaseOrderIdFromListItem,
+                    source: {
+                        api: "purchaseOrder",
+                        mode: "list_details_async",
+                        limit: listLimit,
+                        offset: listOffset,
+                    },
+                })
+                : null;
             const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
             const recordDetailBase = accountHost
                 ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/purchaseOrder`
@@ -632,17 +734,21 @@ router.get("/purchaseOrder", async (req, res) => {
                 recordDetailBase,
                 persistDb,
                 persist: persistResult,
+                compare,
+                compareResult,
                 items,
             });
         }
         const data = await (0, netsuite_rest_client_1.listPurchaseOrders)(listOptions);
+        logger_config_1.default.info(`[PO API] listPurchaseOrders returned, wantDetails=${wantDetails}`);
         if (!wantDetails) {
             const listOnly = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
             let rowsForPersist = listOnly;
-            if (persistDb && listOnly.length > 0) {
-                logger_config_1.default.info(`[PurchaseOrder List] persistDb=true + details=false → per-id GET for Mongo (${listOnly.length} row(s))`);
+            if ((persistDb || compare) && listOnly.length > 0) {
+                logger_config_1.default.info(`[PurchaseOrder List] persistDb/compare + details=false → per-id GET (${listOnly.length} row(s))`);
                 rowsForPersist = await (0, netsuite_rest_client_1.hydratePurchaseOrdersFromListRows)(listOnly, expandOnDetail);
             }
+            logger_config_1.default.info(`[PO API] Calling persistRestPurchaseOrderItems with save=${persistDb} for ${rowsForPersist.length} records.`);
             const persistResult = await (0, purchase_order_rest_dump_1.persistRestPurchaseOrderItems)(rowsForPersist, {
                 save: persistDb,
                 queryContext: {
@@ -653,6 +759,16 @@ router.get("/purchaseOrder", async (req, res) => {
                     dbPayloadSource: persistDb && listOnly.length > 0 ? "per_id_get" : "list_row",
                 },
             });
+            logger_config_1.default.info(`[PO API] persistRestPurchaseOrderItems result: ${JSON.stringify(persistResult)}`);
+            const compareResult = compare
+                ? await (0, ns_rest_compare_service_1.runNsRestCompareBaselineBatch)({
+                    variant: "purchase_order_staged",
+                    items: rowsForPersist,
+                    extractId: netsuite_rest_client_1.extractPurchaseOrderIdFromListItem,
+                    source: { api: "purchaseOrder", mode: "list_only", limit: listLimit, offset: listOffset },
+                })
+                : null;
+            logger_config_1.default.info(`[PO API] runNsRestCompareBaselineBatch result: ${compareResult ? "OK" : "SKIPPED"}`);
             return res.json({
                 success: true,
                 details: false,
@@ -661,13 +777,59 @@ router.get("/purchaseOrder", async (req, res) => {
                 offset: listOffset,
                 persistDb,
                 persist: persistResult,
+                compare,
+                compareResult,
             });
         }
         const listItems = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
         if (wantDetails && listItems.length === 0 && data && typeof data === "object") {
             logger_config_1.default.warn(`[PurchaseOrder List] details=true but no list rows — keys: ${Object.keys(data).join(", ")}`);
         }
+        logger_config_1.default.info(`[PO API] hydratePurchaseOrdersFromListRows for ${listItems.length} items`);
         const items = await (0, netsuite_rest_client_1.hydratePurchaseOrdersFromListRows)(listItems, expandOnDetail);
+        // Build NetSuite PO map by po_number
+        const nsPoMap = new Map();
+        const nsPoNums = [];
+        for (const po of items) {
+            const n = po?.tranId ? String(po.tranId).match(/(\d+)/) : null;
+            const poNum = n ? parseInt(n[1], 10) : null;
+            if (poNum != null) {
+                nsPoMap.set(poNum, po);
+                nsPoNums.push(poNum);
+            }
+        }
+        // Fetch ONLY the matching staged POs from Mongo
+        const nsDb = await (0, mongdodb_config_1.getDb)("netsuite");
+        const baselineCol = nsDb.collection("suite_purchase_order");
+        const stagedPOs = nsPoNums.length > 0
+            ? await baselineCol.find({ po_number: { $in: nsPoNums.map(n => String(n)) } }).toArray()
+            : [];
+        const stagedPoMap = new Map();
+        for (const po of stagedPOs) {
+            if (po.po_number != null)
+                stagedPoMap.set(Number(po.po_number), po);
+        }
+        // Mark onlyInNetSuite on NetSuite POs
+        for (const [poNum, nsPo] of nsPoMap.entries()) {
+            if (!stagedPoMap.has(poNum)) {
+                nsPo.onlyInNetSuite = true;
+            }
+        }
+        // Mark onlyInStaging on staged POs
+        for (const [poNum, staged] of stagedPoMap.entries()) {
+            if (!nsPoMap.has(poNum)) {
+                // Update the staged PO with onlyInStaging flag
+                await baselineCol.updateOne({ po_number: poNum }, { $set: { onlyInStaging: true } });
+            }
+            else {
+                // Remove the flag if it exists and now present in both
+                if (staged.onlyInStaging) {
+                    await baselineCol.updateOne({ po_number: poNum }, { $unset: { onlyInStaging: "" } });
+                }
+            }
+        }
+        // Persist NetSuite POs with onlyInNetSuite flag
+        logger_config_1.default.info(`[PO API] Calling persistRestPurchaseOrderItems with save=${persistDb} for ${items.length} records (list_details)`);
         const persistResult = await (0, purchase_order_rest_dump_1.persistRestPurchaseOrderItems)(items, {
             save: persistDb,
             queryContext: {
@@ -678,10 +840,58 @@ router.get("/purchaseOrder", async (req, res) => {
                 dbPayloadSource: "per_id_get",
             },
         });
+        logger_config_1.default.info(`[PO API] persistRestPurchaseOrderItems result: ${JSON.stringify(persistResult)}`);
+        // Comparison logic and diff log (unchanged)
+        let compareResult = null;
+        let onlyInNetSuite = [];
+        let onlyInStaging = [];
+        let fieldMismatches = [];
+        if (compare) {
+            for (const [poNum, nsPo] of nsPoMap.entries()) {
+                const staged = stagedPoMap.get(poNum);
+                if (!staged) {
+                    onlyInNetSuite.push(nsPo);
+                }
+                else {
+                    const diffs = [];
+                    const fieldsToCompare = ["status", "vendor_id", "distributor", "distributor_order_number", "website_order_number"];
+                    for (const field of fieldsToCompare) {
+                        if ((nsPo[field] || "") !== (staged[field] || "")) {
+                            diffs.push({ field, netsuite: nsPo[field], staging: staged[field] });
+                        }
+                    }
+                    if (diffs.length > 0) {
+                        fieldMismatches.push({ po_number: poNum, diffs, netsuite: nsPo, staging: staged });
+                    }
+                }
+            }
+            for (const [poNum, staged] of stagedPoMap.entries()) {
+                if (!nsPoMap.has(poNum)) {
+                    onlyInStaging.push(staged);
+                }
+            }
+            compareResult = {
+                onlyInNetSuite,
+                onlyInStaging,
+                fieldMismatches,
+                summary: {
+                    onlyInNetSuite: onlyInNetSuite.length,
+                    onlyInStaging: onlyInStaging.length,
+                    fieldMismatches: fieldMismatches.length,
+                }
+            };
+        }
         const accountHost = (process.env.NS_ACCOUNT_ID || "").toLowerCase().replace(/_/g, "-");
         const recordDetailBase = accountHost
             ? `https://${accountHost}.suitetalk.api.netsuite.com/services/rest/record/v1/purchaseOrder`
             : null;
+        // If all three flags are set, do not return data, just acknowledge
+        if (compare && wantDetails && persistDb) {
+            logger_config_1.default.info(`[PO API] All flags set (compare, wantDetails, persistDb) — returning no data, just message.`);
+            // Data processing and storage done, no data returned
+            return res.json({ success: true, message: "POs processed, compared, and stored. No data returned as requested.", persist: persistResult });
+        }
+        // ...existing code...
         return res.json({
             success: true,
             details: true,
@@ -694,25 +904,31 @@ router.get("/purchaseOrder", async (req, res) => {
             recordDetailBase,
             persistDb,
             persist: persistResult,
+            compare,
+            compareResult,
             items,
         });
     }
     catch (e) {
-        logger_config_1.default.error("[PurchaseOrder List] Error:", e.message);
+        logger_config_1.default.error(`[PO API] [PurchaseOrder List] Error:`, e && e.stack ? e.stack : e.message);
         res.status(500).json({ success: false, error: e.message });
     }
 });
-/**
- * GET /purchaseOrder/:id
- * Get single Purchase Order by ID
- * Query: persistDb | saveToDb — upsert into `ns_rest_purchase_order_detail_dump`
- */
 router.get("/purchaseOrder/:id", async (req, res) => {
     const { id } = req.params;
-    const expandSubResources = req.query.expandItems === "true" ? "item" : undefined;
+    const expandSubResources = req.query.expandItems === "true" ? "true" : undefined;
     const persistDb = parsePersistDbFlag(req);
+    const compare = (0, ns_rest_compare_service_1.shouldRunBaselineCompareWithPersist)(req, persistDb);
     try {
         const data = await (0, netsuite_rest_client_1.getPurchaseOrder)(id, expandSubResources);
+        const compareResult = compare
+            ? await (0, ns_rest_compare_service_1.runNsRestCompareBaselineBatch)({
+                variant: "purchase_order_staged",
+                items: [data],
+                extractId: netsuite_rest_client_1.extractPurchaseOrderIdFromListItem,
+                source: { api: "purchaseOrder", mode: "single_record_get", id: String(id) },
+            })
+            : null;
         if (persistDb) {
             const persistResult = await (0, purchase_order_rest_dump_1.persistRestPurchaseOrderItems)([data], {
                 save: true,
@@ -722,9 +938,9 @@ router.get("/purchaseOrder/:id", async (req, res) => {
                     dbPayloadSource: "per_id_get",
                 },
             });
-            return res.json({ success: true, data, persistDb, persist: persistResult });
+            return res.json({ success: true, data, persistDb, persist: persistResult, compare, compareResult });
         }
-        res.json({ success: true, data });
+        res.json({ success: true, data, compare, compareResult });
     }
     catch (e) {
         logger_config_1.default.error(`[PurchaseOrder Get] ${id} Error:`, e.message);
@@ -732,3 +948,228 @@ router.get("/purchaseOrder/:id", async (req, res) => {
     }
 });
 exports.default = router;
+router.get("/test-po-dump-count", async (_req, res) => {
+    try {
+        const nsDb = await (0, mongdodb_config_1.getDb)("netsuite");
+        const col = nsDb.collection("ns_rest_purchase_order_detail_dump");
+        const count = await col.countDocuments();
+        res.json({ success: true, count });
+    }
+    catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+router.get("/flag-only-in-netsuite", async (_req, res) => {
+    try {
+        const result = await flagOnlyInNetSuitePOs();
+        res.json({ success: true, ...result });
+    }
+    catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+async function flagOnlyInNetSuitePOs() {
+    const nsDb = await (0, mongdodb_config_1.getDb)("netsuite");
+    const dumpCol = nsDb.collection("ns_rest_purchase_order_detail_dump");
+    const stagingCol = nsDb.collection("suite_purchase_order");
+    // Get all po_numbers in staging (as numbers for robust comparison)
+    const stagedPOs = await stagingCol.find({}, { projection: { po_number: 1 } }).toArray();
+    const stagedSet = new Set(stagedPOs.map((po) => Number(po.po_number)));
+    console.log("[flagOnlyInNetSuitePOs] stagedSet (po_number):", stagedSet);
+    console.log("[flagOnlyInNetSuitePOs] stagedPOs (po_number):", stagedPOs);
+    // Get all POs in dump
+    const allDumpPOs = await dumpCol.find().toArray();
+    // Validation and logging for payload.otherRefNum
+    let missingCount = 0;
+    let validCount = 0;
+    let matchedCount = 0;
+    let unmatchedCount = 0;
+    allDumpPOs.slice(0, 10).forEach((doc, idx) => {
+        const rawPoNum = doc?.payload?.otherRefNum;
+        const poNum = Number(rawPoNum);
+        if (rawPoNum === undefined || rawPoNum === null || isNaN(poNum)) {
+            missingCount++;
+            console.warn(`[flagOnlyInNetSuitePOs] [Sample ${idx}] MISSING or INVALID payload.otherRefNum for ns_internal_id: ${doc.ns_internal_id}`);
+        }
+        else {
+            validCount++;
+            const isMatched = stagedSet.has(poNum);
+            if (isMatched)
+                matchedCount++;
+            else
+                unmatchedCount++;
+            console.log(`[flagOnlyInNetSuitePOs] [Sample ${idx}] payload.otherRefNum:`, rawPoNum, `(as number: ${poNum}), matched: ${isMatched}`);
+        }
+    });
+    console.log(`[flagOnlyInNetSuitePOs] Sampled dump POs: valid=${validCount}, missing/invalid=${missingCount}, matched=${matchedCount}, unmatched=${unmatchedCount}`);
+    let totalMatched = 0;
+    let totalUnmatched = 0;
+    const bulkOps = allDumpPOs.map((doc) => {
+        const rawPoNum = doc?.payload?.otherRefNum;
+        const poNum = Number(rawPoNum);
+        let onlyInNetSuite = true;
+        if (rawPoNum !== undefined && rawPoNum !== null && !isNaN(poNum)) {
+            onlyInNetSuite = !stagedSet.has(poNum);
+            if (!onlyInNetSuite)
+                totalMatched++;
+            else
+                totalUnmatched++;
+        }
+        else {
+            // If missing, always mark as true and log
+            console.warn(`[flagOnlyInNetSuitePOs] MISSING or INVALID payload.otherRefNum for ns_internal_id: ${doc.ns_internal_id}`);
+            totalUnmatched++;
+        }
+        return {
+            updateOne: {
+                filter: { ns_internal_id: doc.ns_internal_id },
+                update: { $set: { onlyInNetSuite } }
+            }
+        };
+    });
+    if (bulkOps.length > 0) {
+        await dumpCol.bulkWrite(bulkOps);
+    }
+    // Note: If your payloads now only have a link array and not the full data, this means the sync logic or NetSuite API response has changed. You may need to review the sync/fetch logic to ensure all required fields are persisted if you want the full PO data in MongoDB.
+    return {
+        updated: bulkOps.length,
+        matched: totalMatched,
+        notMatched: totalUnmatched,
+        note: "Comparison is done by matching suite_purchase_order.po_number (number) to ns_rest_purchase_order_detail_dump.payload.otherRefNum (string/number). If payloads now only have a link array, check your sync logic or NetSuite API for changes."
+    };
+}
+router.get("/purchaseOrder-details-test", async (req, res) => {
+    const prefer = req.headers.prefer;
+    const idempotencyKey = req.headers["x-netsuite-idempotency-key"];
+    const fetchAll = req.query.fetchAll === "true";
+    const compare = (0, ns_rest_compare_service_1.shouldRunBaselineCompareWithPersist)(req, false); // always false for persistDb
+    logger_config_1.default.info(`[PO API] (TEST) Called with fetchAll=${fetchAll}, compare=${compare}, details=${req.query.details}`);
+    try {
+        if (fetchAll) {
+            const untilExhausted = req.query.untilExhausted === "true";
+            const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
+            const maxRecords = untilExhausted
+                ? (0, netsuite_rest_client_1.nsRestFetchUntilExhaustedCap)()
+                : Number.isFinite(rawMax)
+                    ? Math.min(Math.max(1, rawMax), netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_ABS_MAX)
+                    : netsuite_rest_client_1.PURCHASE_ORDER_FETCH_ALL_DEFAULT_MAX;
+            const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
+            const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1000) : undefined;
+            logger_config_1.default.info(`[PurchaseOrder List] fetchAll — maxRecords=${maxRecords}` +
+                (untilExhausted ? ", untilExhausted=true" : "") +
+                (pageSize != null ? `, pageSize=${pageSize}` : ""));
+            let totalFetched = 0;
+            let allRecords = [];
+            try {
+                const fetchIterator = await (0, netsuite_rest_client_1.fetchAllPurchaseOrders)({
+                    q: req.query.q,
+                    expandSubResources: req.query.expandItems === "true" ? "true" : undefined,
+                    maxRecords: untilExhausted ? undefined : maxRecords,
+                    pageSize,
+                    untilExhausted,
+                });
+                for (const po of fetchIterator) {
+                    allRecords.push(po);
+                    totalFetched++;
+                    if (totalFetched % 100 === 0) {
+                        logger_config_1.default.info(`[PO API] Fetched ${totalFetched} records so far...`);
+                    }
+                }
+            }
+            catch (err) {
+                logger_config_1.default.error(`[PO API] Error during fetchAll streaming:`, err);
+            }
+            logger_config_1.default.info(`[PO API] fetchAll fetched ${totalFetched} records from NetSuite.`);
+            return res.json({
+                success: true,
+                fetchAll: true,
+                untilExhausted,
+                maxRecords,
+                pageSize: pageSize ?? null,
+                count: totalFetched,
+                records: allRecords
+            });
+        }
+        const rawListLimit = req.query.limit != null ? parseInt(String(req.query.limit), 10) : NaN;
+        const listLimit = Number.isFinite(rawListLimit)
+            ? Math.min(Math.max(1, rawListLimit), netsuite_rest_client_1.PURCHASE_ORDER_LIST_ABS_MAX)
+            : netsuite_rest_client_1.PURCHASE_ORDER_LIST_DEFAULT_LIMIT;
+        const rawOffset = req.query.offset != null ? parseInt(String(req.query.offset), 10) : 0;
+        const listOffset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+        const expandOnDetail = req.query.expandItems === "true" ? "true" : undefined;
+        const wantDetails = (0, netsuite_rest_client_1.restListWantDetails)(req.query);
+        const listOptions = {
+            q: req.query.q,
+            limit: listLimit,
+            offset: listOffset,
+            expandSubResources: wantDetails ? undefined : expandOnDetail,
+        };
+        if (prefer === "respond-async") {
+            if (!idempotencyKey) {
+                return res.status(400).json({ success: false, error: "X-NetSuite-Idempotency-Key required for async" });
+            }
+            const data = await (0, netsuite_rest_client_1.listPurchaseOrders)(listOptions);
+            if (!wantDetails) {
+                const listOnly = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
+                return res.status(202).setHeader("Preference-Applied", "respond-async").json({
+                    success: true,
+                    async: true,
+                    idempotencyKey,
+                    details: false,
+                    ...data,
+                    limit: listLimit,
+                    offset: listOffset,
+                    records: listOnly
+                });
+            }
+            const listItems = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
+            const items = await (0, netsuite_rest_client_1.hydratePurchaseOrdersFromListRows)(listItems, expandOnDetail);
+            return res.status(202).setHeader("Preference-Applied", "respond-async").json({
+                success: true,
+                async: true,
+                idempotencyKey,
+                details: true,
+                limit: listLimit,
+                offset: listOffset,
+                hasMore: data.hasMore,
+                totalResults: data.totalResults,
+                count: items.length,
+                records: items
+            });
+        }
+        const data = await (0, netsuite_rest_client_1.listPurchaseOrders)(listOptions);
+        logger_config_1.default.info(`[PO API] listPurchaseOrders returned, wantDetails=${wantDetails}`);
+        if (!wantDetails) {
+            const listOnly = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
+            return res.json({
+                success: true,
+                details: false,
+                ...data,
+                limit: listLimit,
+                offset: listOffset,
+                records: listOnly
+            });
+        }
+        const listItems = (0, netsuite_rest_client_1.normalizePurchaseOrderListItems)(data);
+        const items = await (0, netsuite_rest_client_1.hydratePurchaseOrdersFromListRows)(listItems, expandOnDetail);
+        return res.json({
+            success: true,
+            details: true,
+            limit: listLimit,
+            offset: listOffset,
+            hasMore: data.hasMore,
+            totalResults: data.totalResults,
+            count: items.length,
+            records: items
+        });
+    }
+    catch (e) {
+        const status = e?.response?.status;
+        const data = e?.response?.data;
+        logger_config_1.default.error(`[PO API] [PurchaseOrder List] FAILED - Status: ${status || "N/A"}`);
+        if (data)
+            logger_config_1.default.error(`[PO API] [PurchaseOrder List] Data: ${JSON.stringify(data)}`);
+        logger_config_1.default.error(`[PO API] [PurchaseOrder List] Stack: ${e.stack || e.message}`);
+        res.status(500).json({ success: false, error: e.message, status, data });
+    }
+});

@@ -3,7 +3,8 @@ import log from "../config/logger.config";
 import { extractPurchaseOrderIdFromListItem } from "./netsuite.rest.client";
 
 /** Mongo collection for raw NetSuite REST purchase order payloads (one document per PO row). */
-export const NS_REST_PO_DUMP_COLLECTION = "ns_rest_purchase_order_detail_dump";
+// export const NS_REST_PO_DUMP_COLLECTION = "ns_rest_purchase_order_detail_dump";
+export const NS_REST_PO_DUMP_COLLECTION = "ns_rest_purchase_order_detail_dump_dummy";
 
 export type PersistRestPurchaseOrderItemsOptions = {
     save: boolean;
@@ -58,9 +59,12 @@ export async function persistRestPurchaseOrderItems(
     const col = ns_db.collection(NS_REST_PO_DUMP_COLLECTION);
     const now = new Date();
 
+
     for (const item of items) {
         const nsId = extractNsIdFromRestPayload(item);
+        // log.info(`[NS REST PO dump][DEBUG] Attempting upsert. Extracted nsId: ${nsId}, PO object: ${JSON.stringify(item)}`);
         if (!nsId) {
+            log.warn(`[NS REST PO dump][DEBUG] Skipping PO object due to missing nsId. PO object: ${nsId},   `);
             base.skipped++;
             continue;
         }
@@ -74,6 +78,7 @@ export async function persistRestPurchaseOrderItems(
 
         try {
             await col.replaceOne({ ns_internal_id: nsId }, doc, { upsert: true });
+            log.info(`[NS REST PO dump][DEBUG] Upserted PO with nsId: ${nsId}`);
             base.upserted++;
         } catch (err: any) {
             base.errors++;

@@ -46,7 +46,7 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query", "N/task", "N/fi
         var sections = (payload && payload.sections) || ["all"];
         var isAll = sections.indexOf("all") >= 0;
         log.debug("DIAGNOSTIC_SECTIONS", "Sections: " + JSON.stringify(sections) + ", isAll: " + isAll);
-        var result = { _timestamp: new Date().toISOString() };
+        var result = { _timestamp: new Date().toISOString(), debug_payload: payload };
 
         // ── Account Info ─────────────────────────────────────────────────
         if (isAll || sections.indexOf("account") >= 0) {
@@ -2347,6 +2347,171 @@ define(["N/search", "N/record", "N/runtime", "N/log", "N/query", "N/task", "N/fi
                 log.error("PO_AUDIT", poAuditErr.message);
                 result.po_audit = { error: poAuditErr.message };
             }
+        }
+
+        // ── Add Item Vendor ──────────────────────────────────────────
+        if (sections.indexOf("add_item_vendor") >= 0) {
+            try {
+                var itemRec = record.load({ type: record.Type.INVENTORY_ITEM, id: payload.item_id, isDynamic: true });
+                itemRec.selectNewLine({ sublistId: 'itemvendor' });
+                itemRec.setCurrentSublistValue({ sublistId: 'itemvendor', fieldId: 'vendor', value: payload.vendor_id });
+                itemRec.commitLine({ sublistId: 'itemvendor' });
+                var savedItemId = itemRec.save();
+                result.add_item_vendor = { success: true, id: savedItemId };
+            } catch (e) {
+                result.add_item_vendor = { error: e.message };
+            }
+        }
+
+        // ── List Locations ──────────────────────────────────────────
+        if (sections.indexOf("list_locations") >= 0) {
+            try {
+                var locResults = search.create({
+                    type: search.Type.LOCATION,
+                    filters: [["isinactive", "is", "F"]],
+                    columns: ["internalid", "name"]
+                }).run().getRange({ start: 0, end: 100 });
+                var locs = [];
+                for (var l = 0; l < locResults.length; l++) {
+                    locs.push({ id: locResults[l].id, name: locResults[l].getValue("name") });
+                }
+                result.list_locations = locs;
+            } catch (le) { result.list_locations = { error: le.message }; }
+        }
+
+        // ── PO Lookup — find PO by reference number ──────────────────────
+        if (sections.indexOf("po_lookup") >= 0) {
+            try {
+                var reqPo = payload.po;
+                if (!reqPo) {
+                    result.po_lookup = { error: "Missing 'po' in payload" };
+                } else {
+                    var results = search.create({
+                        type: search.Type.PURCHASE_ORDER,
+                        filters: [
+                            ["otherrefnum", "is", reqPo],
+                            "AND",
+                            ["mainline", "is", "T"]
+                        ],
+                        columns: ["internalid", "tranid"]
+                    }).run().getRange({ start: 0, end: 5 });
+
+                    var poList = [];
+                    for (var p = 0; p < results.length; p++) {
+                        poList.push({
+                            id: results[p].id,
+                            poNumber: results[p].getValue("tranid")
+                        });
+                    }
+                    result.po_lookup = { purchase_orders: poList };
+                }
+            } catch (poLookErr) {
+                result.po_lookup = { error: poLookErr.message };
+            }
+        }
+
+        // ── Record Inspect (Deep Analysis) ───────────────────────────────────
+        if (sections.indexOf("record_inspect") >= 0) {
+            try {
+                var insType = payload.recordType || "salesorder";
+                var insId = parseInt(payload.id, 10);
+                if (!insId) {
+                    result.record_inspect = { error: "Missing 'id' parameter" };
+                } else {
+                    var rec = record.load({ type: insType, id: insId });
+                    var fields = rec.getFields();
+                    var data = {};
+                    for (var i = 0; i < fields.length; i++) {
+                        try {
+                            var val = rec.getValue({ fieldId: fields[i] });
+                            if (val !== null && val !== "" && val !== undefined) {
+                                data[fields[i]] = val;
+                            }
+                        } catch (e) {}
+                    }
+
+                    // ADDED: Sublist Extraction
+                    var sublists = ["item", "package", "links"];
+                    var sublistData = {};
+                    for (var s = 0; s < sublists.length; s++) {
+                        try {
+                            var subId = sublists[s];
+                            var lineCount = rec.getLineCount({ sublistId: subId });
+                            if (lineCount > 0) {
+                                var lines = [];
+                                var subFields = rec.getSublistFields({ sublistId: subId });
+                                for (var l = 0; l < lineCount; l++) {
+                                    var lineObj = { _line: l };
+                                    for (var sf = 0; sf < subFields.length; sf++) {
+                                        try {
+                                            var sVal = rec.getSublistValue({ sublistId: subId, fieldId: subFields[sf], line: l });
+                                            if (sVal !== null && sVal !== "" && sVal !== undefined) {
+                                                lineObj[subFields[sf]] = sVal;
+                                            }
+                                        } catch (se) {}
+                                    }
+                                    lines.push(lineObj);
+                                }
+                                sublistData[subId] = lines;
+                            }
+                        } catch (e) {}
+                    }
+
+                    var related = [];
+                    try {
+                        var relResults = search.create({
+                            type: search.Type.TRANSACTION,
+                            filters: [["createdfrom", "anyof", insId]],
+                            columns: ["type", "tranid"]
+                        }).run().getRange({ start: 0, end: 50 });
+                        for (var r = 0; r < relResults.length; r++) {
+                            related.push({
+                                id: relResults[r].id,
+                                type: relResults[r].getValue("type"),
+                                tranid: relResults[r].getValue("tranid")
+                            });
+                        }
+                    } catch (rele) {}
+
+                    result.record_inspect = {
+                        id: insId,
+                        type: insType,
+                        fields: data,
+                        sublists: sublistData,
+                        related_records: related
+                    };
+                }
+            } catch (e) { result.record_inspect = { error: e.message }; }
+        }
+
+        // ── Delete Record (Admin Only) ──────────────────────────────────────
+        if (sections.indexOf("delete_record") >= 0) {
+            try {
+                var delType = payload.recordType;
+                var delId = payload.id;
+                if (!delType || !delId) {
+                    result.delete_record = { error: "Missing type or id" };
+                } else {
+                    record.delete({ type: delType, id: delId });
+                    result.delete_record = { success: true, id: delId, type: delType };
+                    log.audit("RECORD_DELETED", delType + " ID: " + delId);
+                }
+            } catch (delErr) {
+                result.delete_record = { error: delErr.message };
+            }
+        }
+
+        // ── Record Fields (Metadata) ────────────────────────────────────────
+        if (sections.indexOf("record_fields") >= 0) {
+            try {
+                var rfType = payload.recordType || "salesorder";
+                var rfRec = record.create({ type: rfType, isDynamic: true });
+                result.record_fields = {
+                    type: rfType,
+                    fields: rfRec.getFields(),
+                    sublists: rfRec.getSublists()
+                };
+            } catch (e) { result.record_fields = { error: e.message }; }
         }
 
         log.audit("DIAGNOSTIC", "Sections: " + sections.join(", "));

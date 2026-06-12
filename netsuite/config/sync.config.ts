@@ -8,7 +8,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const SYNC_MODE_SO:   "skip" | "update" = "update";   // SO needs update for status changes
-export const SYNC_MODE_PO:   "skip" | "update" = "skip";     // PO: skip — prevents duplicate creation
+export const SYNC_MODE_PO:   "skip" | "update" = "update";   // PO: update — corrects existing zero-dollar or mismatched POs
 export const SYNC_MODE_BILL: "skip" | "update" = "skip";     // Bill: skip — one-time creation
 
 // ⚠️ TEST_MODE: When true, stops after the first real insert/update (skips don't count).

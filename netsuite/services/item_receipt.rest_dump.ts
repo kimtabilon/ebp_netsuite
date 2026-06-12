@@ -3,10 +3,12 @@ import log from "../config/logger.config";
 import { extractItemReceiptIdFromListItem } from "./netsuite.rest.client";
 
 export const NS_REST_ITEM_RECEIPT_DUMP_COLLECTION = "ns_rest_item_receipt_detail_dump";
+export const NS_REST_ITEM_RECEIPT_DUMP_COLLECTION_DUMMY = "ns_rest_item_receipt_detail_dump_dummy";
 
 export type PersistRestItemReceiptRowsOptions = {
     save: boolean;
     queryContext?: Record<string, unknown>;
+    collection?: string;
 };
 
 export type PersistRestItemReceiptRowsResult = {
@@ -31,9 +33,10 @@ export async function persistRestItemReceiptRows(
     items: any[],
     options: PersistRestItemReceiptRowsOptions
 ): Promise<PersistRestItemReceiptRowsResult> {
+    const targetCollection = options.collection || NS_REST_ITEM_RECEIPT_DUMP_COLLECTION;
     const base: PersistRestItemReceiptRowsResult = {
         saved: false,
-        collection: NS_REST_ITEM_RECEIPT_DUMP_COLLECTION,
+        collection: targetCollection,
         upserted: 0,
         skipped: 0,
         errors: 0,
@@ -49,7 +52,7 @@ export async function persistRestItemReceiptRows(
     }
 
     const ns_db = await getDb("netsuite");
-    const col = ns_db.collection(NS_REST_ITEM_RECEIPT_DUMP_COLLECTION);
+    const col = ns_db.collection(targetCollection);
     const now = new Date();
 
     for (const item of items) {
@@ -77,7 +80,7 @@ export async function persistRestItemReceiptRows(
 
     base.saved = true;
     log.info(
-        `[NS REST item receipt dump] collection=${NS_REST_ITEM_RECEIPT_DUMP_COLLECTION} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
+        `[NS REST item receipt dump] collection=${targetCollection} upserted=${base.upserted} skipped=${base.skipped} errors=${base.errors}`
     );
     return base;
 }

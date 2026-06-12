@@ -4,3 +4,14 @@ logs
 .env
 env
 schemas/*
+
+itemfull.js
+scripts.md
+so_sync_error.json
+test-item.md
+test.js
+test2.js
+text.md
+PO1.js
+netsuite/scratch
+netsuite/services/testfuntions

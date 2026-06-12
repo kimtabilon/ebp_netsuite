@@ -1,23 +1,12 @@
+
+
 import { getDb } from "../config/mongdodb.config";
-import { postToNetsuiteForPO, postBatchToNetsuiteForPO } from "./netsuite.client";
-import { SYNC_MODE_PO as SYNC_MODE, TEST_MODE, STOP_ON_ERROR, MAX_RETRIES } from "../config/sync.config";
+import { postBatchToNetsuiteForPO } from "./netsuite.client";
+import { SYNC_MODE_PO as SYNC_MODE, } from "../config/sync.config";
 import { withConcurrency } from "../config/concurrency.config";
 import log from "../config/logger.config";
 
-// ── Governance budget ────────────────────────────────────────────────────────
-// RESTlet limit: 5,000 units/invocation
-// Stocking PO:  ~42 units (4 SKUs)  → ~119 POs per invocation (never hit — 1 PO/call)
-// Dropship PO:  ~77 units (1 SKU)   → ~64 POs per invocation  (never hit — 1 PO/call)
-// Each HTTP call = 1 RESTlet invocation, so governance is never a concern.
-// Batch limits below control server-side concurrency + NetSuite rate limits.
-const PARALLEL_WORKERS = 5;
-const BATCH_SIZE = 10;           // POs per RESTlet call (batch mode)
-const STOCKING_BATCH = 200;      // raised — fewer HTTP calls now
-const DROPSHIP_BATCH = 200;      // raised — fewer HTTP calls now
 
-// Results we consider fully resolved and should never re-queue
-// (matches the pattern in sales_order.sync.ts)
-const RESOLVED_RESULTS = ["created", "updated", "no_items", "skipped_no_po_number"];
 
 // Parse created_at safely — sends "M/D/YYYY" to avoid UTC→timezone date shift.
 // NetSuite trandate only needs a date, not a time.
@@ -29,372 +18,189 @@ function toSafeISO(raw: any): string {
     return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
 }
 
+
+
 export const syncPurchaseOrdersToNetsuite = async (): Promise<any[]> => {
-    log.info(`[NS PO Sync] Starting purchase order sync — mode: ${SYNC_MODE}, workers: ${PARALLEL_WORKERS}, batchSize: ${BATCH_SIZE}, stopOnError: ${STOP_ON_ERROR}`);
-
     const ns_db = await getDb("netsuite");
-    const collection = ns_db.collection("suite_purchase_order");
-    const soCollection = ns_db.collection("suite_sales_order");
-
-    // Base filter: skip permanently failed and already-resolved POs.
-    // update mode: re-queue everything except resolved and permanently failed
-    // skip mode:   only pick up unsynced POs
-    const baseFilter = { ns_synced: { $exists: false } };
-
-    // ── Phase 1: Stocking POs (no SO dependency) ────────────────────────
-    const stockingOrders = await collection
-        .find({ ...baseFilter, po_type: { $ne: "Dropship" } })
-        .limit(STOCKING_BATCH)
-        .toArray();
-
-    // ── Phase 2: Dropship POs (only if SO is synced) ────────────────────
-    // Strategy: find synced SO order numbers first, then fetch matching POs.
-    // Old approach fetched first N POs and hoped some had synced SOs — failed
-    // when early POs in natural order all lacked synced SOs.
-    let dropshipOrders: any[] = [];
-    const syncedSOs = await soCollection
-        .find({ ns_synced: true, ns_result: "created" })
-        .project({ otherrefnum: 1 })
-        .toArray();
-
-    if (syncedSOs.length > 0) {
-        const syncedOrderNumbers = syncedSOs.map((s: any) => s.otherrefnum);
-
-        dropshipOrders = await collection
-            .find({
-                ...baseFilter,
-                po_type: "Dropship",
-                website_order_number: { $in: syncedOrderNumbers }
-            })
-            .limit(DROPSHIP_BATCH)
-            .toArray();
-
-        log.info(`[NS PO Sync] Dropship: ${syncedSOs.length} synced SOs, ${dropshipOrders.length} POs ready`);
-    }
-
-    const orders = [...stockingOrders, ...dropshipOrders];
-
-    if (orders.length === 0) {
-        log.info("[NS PO Sync] No unsynced purchase orders. Skipping.");
-        return [];
-    }
-
-    log.info(`[NS PO Sync] Found ${orders.length} POs to process${TEST_MODE ? " (TEST MODE)" : ""}`);
-
-    // In TEST_MODE or STOP_ON_ERROR, fall back to serial processing
-    if (TEST_MODE || STOP_ON_ERROR) {
-        return syncSerial(collection, orders);
-    }
-
-    // ── Split orders into batches of BATCH_SIZE ───────────────────────────
-    const batches: any[][] = [];
-    for (let i = 0; i < orders.length; i += BATCH_SIZE) {
-        batches.push(orders.slice(i, i + BATCH_SIZE));
-    }
-
-    log.info(`[NS PO Sync] Split ${orders.length} POs into ${batches.length} batches of up to ${BATCH_SIZE}`);
-
-    // ── Parallel sync with worker pool (one batch per worker iteration) ──
-    let sent = 0;
-    let errors = 0;
-    let skipped = 0;
-    const results: any[] = [];
-    let batchIndex = 0;
-
-    async function worker() {
-        while (batchIndex < batches.length) {
-            const bi = batchIndex++;
-            const batchResults = await syncBatchPO(collection, batches[bi]);
-            for (const entry of batchResults) {
-                results.push(entry);
-                if (entry.action === "no_items" || entry.action === "skipped") skipped++;
-                else if (entry.success === false) errors++;
-                else sent++;
-            }
-        }
-    }
-
-    await Promise.all(
-        Array.from({ length: Math.min(PARALLEL_WORKERS, batches.length) }, () => worker())
-    );
-
-    log.info(`[NS PO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}, batches: ${batches.length}`);
-    return results;
-};
-
-// ── Process a batch of POs: single RESTlet call + per-PO MongoDB updates ──────
-async function syncBatchPO(collection: any, batch: any[]): Promise<any[]> {
-    const t0 = Date.now();
+    const dummyCol = ns_db.collection("suite_purchase_order_dummy");
     const results: any[] = [];
 
-    // Build payloads & filter out invalid POs
-    const validPOs: any[] = [];
-    const payloads: any[] = [];
+    log.info("[syncPurchaseOrdersToNetsuite] Fast Sync starting with cursor-based processing...");
 
-    for (const po of batch) {
-        if (!po.po_number && po.po_number !== 0) {
-            log.warn(`[NS PO Sync] Skipping PO _id=${po._id} — missing po_number`);
-            await collection.updateOne(
-                { _id: po._id },
-                { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "skipped_no_po_number" } }
-            );
-            results.push({ po_number: null, success: true, action: "skipped", reason: "missing_po_number" });
-            continue;
-        }
+    const filter = { po_number: 233175 };
+    // const filter = { $or: [{ ns_synced: null },] };
 
-        validPOs.push(po);
-        payloads.push({
-            action: SYNC_MODE,
-            po_number: po.po_number,
-            otherrefnum: String(po.po_number),
-            vendor_id: po.vendor_id,
-            distributor: po.distributor,
-            distributor_order_number: po.distributor_order_number,
-            status: po.status,
-            invoice: po.invoice,
-            tracking: po.tracking,
-            order_items: po.order_items,
-            website_order_number: po.website_order_number,
-            po_type: po.po_type || "",
-            stocking_warehouse: po.stocking_warehouse || "",
-            created_at: toSafeISO(po.created_at)
-        });
-    }
+    const totalToProcess = await dummyCol.countDocuments(filter);
+    log.info(`[syncPurchaseOrdersToNetsuite] Found ${totalToProcess} dummy POs to sync.`);
 
-    if (payloads.length === 0) return results;
+    if (totalToProcess === 0) return [];
 
-    try {
-        // Single HTTP call for the entire batch via concurrency semaphore
-        const batchLabel = `PO batch [${validPOs.map((p: any) => p.po_number).join(",")}]`;
-        const response = await withConcurrency(() => postBatchToNetsuiteForPO(payloads), batchLabel);
+    const allDocs = await dummyCol.find(filter).toArray();
+    const BATCH_SIZE = 1;
 
-        const ms = Date.now() - t0;
-        const nsResults: any[] = response?.results || [];
 
-        // Process each result from the batch response
-        for (let i = 0; i < validPOs.length; i++) {
-            const po = validPOs[i];
-            const result = nsResults[i];
+    // Use parallel workers (matching NS_MAX_CONCURRENT) to process batches efficiently
+    const workers = Array.from({ length: 2 }, async () => {
+        while (true) {
+            const batch = allDocs.splice(0, BATCH_SIZE);
 
-            if (!result) {
-                // No result for this PO — shouldn't happen but handle gracefully
-                log.error(`[NS PO Sync] No result for PO ${po.po_number} in batch response`);
-                await markFailed(collection, po, "no_result_in_batch");
-                results.push({ po_number: po.po_number, success: false, error: "no_result_in_batch", ms });
-                continue;
-            }
+            if (batch.length === 0) break;
 
-            // Governance exhausted — RESTlet couldn't process this PO
-            if (result.error === "governance_exhausted") {
-                log.warn(`[NS PO Sync] Governance exhausted for PO ${po.po_number} — will retry next cycle`);
-                results.push({ po_number: po.po_number, success: false, error: "governance_exhausted", ms });
-                continue;
-            }
 
-            // no_items = SKUs not found in NetSuite
-            if (result.action === "no_items") {
-                await collection.updateOne(
-                    { _id: po._id },
-                    { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "no_items" } }
-                );
-                log.info(`[NS PO Sync] No items — skipped: ${po.po_number}`);
-                results.push({ po_number: po.po_number, success: true, action: "no_items", ms });
-                continue;
-            }
+            const payloads: any[] = [];
+            const poRefs: any[] = [];
 
-            // NetSuite returned success: false
-            if (result.success === false) {
-                log.error(`[NS PO Sync] Failed: ${po.po_number} → ${result.error}`);
-                await markFailed(collection, po, result.error);
-                results.push({ po_number: po.po_number, success: false, error: result.error, ms });
-                continue;
-            }
-
-            // Mark as synced
-            await collection.updateOne(
-                { _id: po._id },
-                {
-                    $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: result.action },
-                    $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
+            // Prepare payloads for NetSuite
+            for (const dummy of batch) {
+                if (!dummy.po_number && dummy.po_number !== 0) {
+                    await dummyCol.updateOne({ _id: dummy._id }, {
+                        $set: {
+                            ns_synced: false,
+                            ns_synced_at: new Date(),
+                            ns_result: "skipped_no_po_number",
+                            ns_error: "missing_po_number"
+                        }
+                    });
+                    results.push({ po_number: dummy.po_number, skipped: true, errorDetails: "missing_po_number", action: "skipped" });
+                    continue;
                 }
-            );
-            log.info(`[NS PO Sync] Synced: ${po.po_number} → ${result.action}`);
-            results.push({ po_number: po.po_number, ...result, ms });
-        }
 
-        log.info(`[NS PO Sync] Batch of ${validPOs.length} completed in ${ms}ms`);
-
-    } catch (e: any) {
-        const ms = Date.now() - t0;
-        const errMsg = e?.response?.data || e.message;
-        log.error(`[NS PO Sync] Batch call failed (${ms}ms): ${errMsg} — falling back to individual calls`);
-
-        // Fallback: process each PO individually
-        for (const po of validPOs) {
-            const entry = await syncOnePO(collection, po);
-            results.push(entry);
-        }
-    }
-
-    return results;
-}
-
-// ── Process a single PO: RESTlet call + MongoDB status update ─────────────
-async function syncOnePO(collection: any, po: any): Promise<any> {
-    const t0 = Date.now();
-
-    // Guard: skip POs without a valid po_number — prevents ghost records in NetSuite
-    if (!po.po_number && po.po_number !== 0) {
-        log.warn(`[NS PO Sync] Skipping PO _id=${po._id} — missing po_number`);
-        await collection.updateOne(
-            { _id: po._id },
-            { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "skipped_no_po_number" } }
-        );
-        return { po_number: null, success: true, action: "skipped", reason: "missing_po_number" };
-    }
-
-    try {
-        const result = await withConcurrency(() => postToNetsuiteForPO({
-            action: SYNC_MODE,
-            po_number: po.po_number,
-            otherrefnum: String(po.po_number),
-            vendor_id: po.vendor_id,
-            distributor: po.distributor,
-            distributor_order_number: po.distributor_order_number,
-            status: po.status,
-            invoice: po.invoice,
-            tracking: po.tracking,
-            order_items: po.order_items,
-            website_order_number: po.website_order_number,
-            po_type: po.po_type || "",
-            stocking_warehouse: po.stocking_warehouse || "",
-            created_at: toSafeISO(po.created_at)
-        }), `PO ${po.po_number}`);
-
-        const ms = Date.now() - t0;
-
-        // no_items = SKUs not found in NetSuite — mark as synced so we don't retry
-        if (result.action === "no_items") {
-            await collection.updateOne(
-                { _id: po._id },
-                { $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: "no_items" } }
-            );
-            log.info(`[NS PO Sync] No items — skipped: ${po.po_number} (${ms}ms)`);
-            return { po_number: po.po_number, success: true, action: "no_items", ms };
-        }
-
-        // If NetSuite returned success: false
-        if (result.success === false) {
-            log.error(`[NS PO Sync] Failed: ${po.po_number} → ${result.error} (${ms}ms)`);
-            await markFailed(collection, po, result.error);
-            return { po_number: po.po_number, success: false, error: result.error, ms };
-        }
-
-        // Mark as synced
-        await collection.updateOne(
-            { _id: po._id },
-            {
-                $set: { ns_synced: true, ns_synced_at: new Date(), ns_result: result.action },
-                $unset: { ns_error: "", ns_retry_count: "", ns_failed: "" }
+                const payload: any = {
+                    action: SYNC_MODE,
+                    po_number: dummy.po_number,
+                    otherrefnum: String(dummy.po_number),
+                    vendor_id: dummy.vendor_id,
+                    distributor: dummy.distributor,
+                    distributor_order_number: dummy.distributor_order_number,
+                    status: dummy.status,
+                    invoice: dummy.invoice,
+                    tracking: dummy.tracking,
+                    order_items: dummy.order_items,
+                    website_order_number: dummy.website_order_number,
+                    po_type: dummy.po_type || "",
+                    stocking_warehouse: dummy.stocking_warehouse || "",
+                    created_at: toSafeISO(dummy.created_at)
+                };
+                payloads.push(payload);
+                poRefs.push({ dummy });
             }
-        );
-        log.info(`[NS PO Sync] Synced: ${po.po_number} → ${result.action} (${ms}ms)`);
-        return { po_number: po.po_number, ...result, ms };
 
-    } catch (e: any) {
-        const ms = Date.now() - t0;
-        const errMsg = e?.response?.data || e.message;
-        log.error(`[NS PO Sync] Error: ${po.po_number}: ${errMsg} (${ms}ms)`);
-        await markFailed(collection, po, errMsg);
-        return { po_number: po.po_number, success: false, error: errMsg, ms };
-    }
-}
+            if (payloads.length === 0) continue;
 
-// ── Serial fallback for TEST_MODE / STOP_ON_ERROR ─────────────────────────
-async function syncSerial(collection: any, orders: any[]): Promise<any[]> {
-    let sent = 0, errors = 0, skipped = 0;
-    const results: any[] = [];
+            // Batch post to NetSuite
+            let nsResults: any[] = [];
+            try {
+                const batchLabel = `syncPurchaseOrdersToNetsuite batch [${payloads.map((p: any) => p.po_number).join(",")}]`;
+                const response = await withConcurrency(() => postBatchToNetsuiteForPO(payloads), batchLabel);
 
-    for (const po of orders) {
-        const entry = await syncOnePO(collection, po);
-        results.push(entry);
-
-        if (entry.action === "no_items" || entry.action === "skipped") { skipped++; continue; }
-        if (entry.success === false) {
-            errors++;
-            if (STOP_ON_ERROR) {
-                log.error(`[NS PO Sync] STOP_ON_ERROR — halting batch.`);
-                break;
+                if (response && Array.isArray(response.results)) {
+                    nsResults = response.results;
+                } else if (Array.isArray(response.batch)) {
+                    nsResults = response.batch;
+                } else if (Array.isArray(response)) {
+                    nsResults = response;
+                } else {
+                    log.error(`[syncPurchaseOrdersToNetsuite] Unexpected batch response format`, response);
+                }
+            } catch (err: any) {
+                const safeError = err?.response?.data || err?.message || String(err);
+                log.error(`[syncPurchaseOrdersToNetsuite] Batch call failed:`, safeError);
             }
-            continue;
-        }
 
-        sent++;
-        if (TEST_MODE) {
-            log.info(`[NS PO Sync] TEST_MODE — stopping after first insert/update`);
-            break;
-        }
-    }
+            // Process each result from the batch response
+            for (let j = 0; j < poRefs.length; j++) {
+                const { dummy } = poRefs[j];
+                const nsResult = nsResults[j];
+                let dummyUpdate: any = {};
+                let status: any = {
+                    po_number: dummy.po_number,
+                    ns_synced: false,
+                    skipped: false,
+                    ns_error: false,
+                    errorDetails: null,
+                    action: null,
+                    netsuiteResult: nsResult
+                };
 
-    log.info(`[NS PO Sync] Done — sent: ${sent}, skipped: ${skipped}, errors: ${errors}, total: ${orders.length}`);
+                if (!nsResult) {
+                    status.ns_error = true;
+                    status.errorDetails = "no_result_in_batch";
+                    status.action = "error";
+                    dummyUpdate = {
+                        $set: {
+                            ns_synced: false,
+                            ns_synced_at: new Date(),
+                            ns_result: "error",
+                            ns_error: "no_result_in_batch"
+                        }
+                    };
+                } else if (nsResult.success === false) {
+                    status.ns_error = true;
+                    status.errorDetails = nsResult.error || "Unknown NetSuite error";
+                    status.action = "error";
+                    dummyUpdate = {
+                        $set: {
+                            ns_synced: false,
+                            ns_synced_at: new Date(),
+                            ns_result: "error",
+                            ns_error: status.errorDetails
+                        }
+                    };
+                } else if (nsResult.action === "no_items") {
+                    status.skipped = true;
+                    status.action = "no_items";
+                    status.ns_error = true;
+                    status.errorDetails = nsResult.error || "no_items";
+                    dummyUpdate = {
+                        $set: {
+                            ns_synced: false,
+                            ns_synced_at: null,
+                            ns_error_at: new Date(),
+                            ns_result: "no_items",
+                            ns_error: nsResult.error || "no_items"
+                        }
+                    };
+                } else if (nsResult.action === "skipped") {
+                    status.skipped = true;
+                    status.action = "skipped";
+                    status.alreadyExist = true; // Mark as already existing
+                    dummyUpdate = {
+                        $set: {
+                            ns_synced: true,
+                            ns_synced_at: new Date(),
+                            ns_result: "skipped",
+                            alreadyExist: true
+                        },
+                        $unset: { ns_error: "", ns_error_at: "" }
+                    };
+                } else {
+                    status.ns_synced = true;
+                    status.action = nsResult.action || "created";
+
+                    // Set alreadyExist flag: false for created, true for updated
+                    const isUpdate = status.action === "updated";
+                    status.alreadyExist = isUpdate;
+
+                    dummyUpdate = {
+                        $set: {
+                            ns_synced: true,
+                            ns_synced_at: new Date(),
+                            ns_result: status.action,
+                            alreadyExist: isUpdate,
+                            ns_linked_so: nsResult.linkedSo || null,
+                            ns_internal_id: nsResult.internalId || null
+                        },
+                        $unset: { ns_error: "" }
+                    };
+                }
+                await dummyCol.updateOne({ _id: dummy._id }, dummyUpdate);
+                results.push(status);
+            }
+        }
+    });
+
+    await Promise.all(workers);
+
+    log.info(`[syncPurchaseOrdersToNetsuite] Fast Sync complete. Processed ${results.length} POs.`);
     return results;
-}
-
-// ─── Mark order as failed with retry tracking ────────────────────────────────
-async function markFailed(collection: any, order: any, error: any) {
-    const retryCount = (order.ns_retry_count || 0) + 1;
-    const permanentlyFailed = true; //retryCount >= MAX_RETRIES;
-
-    const update: any = {
-        $set: {
-            ns_synced: false,
-            ns_error: typeof error === "string" ? error : JSON.stringify(error),
-            ns_error_at: new Date(),
-            ns_retry_count: retryCount,
-        }
-    };
-
-    if (permanentlyFailed) {
-        update.$set.ns_failed = true;
-        log.error(`[NS PO Sync] PO ${order.po_number} no retries — marked as permanently failed.`);
-        console.error(`Purchase order sync failed for PO #${order.po_number}:`, error);
-    }
-
-    await collection.updateOne({ _id: order._id }, update);
-}
-
-// ─── Retry failed POs ────────────────────────────────────────────────────────
-export const retryFailedPurchaseOrders = async (resetAll = false): Promise<any> => {
-    const ns_db = await getDb("netsuite");
-    const collection = ns_db.collection("suite_purchase_order");
-
-    const filter = resetAll
-        ? { $or: [{ ns_synced: false, ns_error: { $exists: true } }, { ns_failed: true }] }
-        : { ns_synced: false, ns_error: { $exists: true }, ns_failed: { $ne: true } };
-
-    const failedOrders = await collection.find(filter).toArray();
-
-    if (failedOrders.length === 0) {
-        return { message: "No failed POs to retry.", count: 0 };
-    }
-
-    const result = await collection.updateMany(
-        { _id: { $in: failedOrders.map((o: any) => o._id) } },
-        {
-            $set: { ns_synced: false },
-            $unset: { ns_error: "", ns_error_at: "", ns_retry_count: "", ns_failed: "" }
-        }
-    );
-
-    const orderList = failedOrders.map((o: any) => ({
-        po_number: o.po_number,
-        previousError: o.ns_error,
-        retryCount: o.ns_retry_count || 0
-    }));
-
-    return {
-        message: `Reset ${result.modifiedCount} failed POs for retry.`,
-        count: result.modifiedCount,
-        orders: orderList
-    };
 };

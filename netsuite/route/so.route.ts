@@ -1,4 +1,5 @@
 import { Router } from "express";
+import axios from "axios";
 import log from "../config/logger.config";
 import { getDb } from "../config/mongdodb.config";
 import { stageSalesOrders } from "../services/sales_order.stage";
@@ -11,6 +12,9 @@ import {
 } from "../services/sales_order.sync";
 import { migrateSalesOrderSchema, migrateMultiVendorSchema } from "../services/sales_order.migrate";
 import { persistRestSalesOrderItems, NS_REST_SO_DUMP_COLLECTION } from "../services/sales_order.rest_dump";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import {
     runNsRestCompareBaselineBatch,
     parseCompareOrderSource,
@@ -484,16 +488,28 @@ router.get("/salesOrder", async (req: any, res: any) => {
     try {
         // fetchAll: capped batch of full records (parallel detail fetches, shared NS concurrency)
         if (fetchAll) {
-            const untilExhausted = req.query.untilExhausted === "true";
-            const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
-            const maxRecords = untilExhausted
-                ? nsRestFetchUntilExhaustedCap()
-                : Number.isFinite(rawMax)
-                  ? Math.min(Math.max(1, rawMax), SALES_ORDER_FETCH_ALL_ABS_MAX)
-                  : SALES_ORDER_FETCH_ALL_DEFAULT_MAX;
+     
+         
+            let checkpoint = { lastOffset: 0, lastId: null, updatedAt: null };
+      
 
-            const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
-            const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1_000) : undefined;
+                        const untilExhausted = req.query.untilExhausted === "true";
+                        const rawMax = req.query.maxRecords != null ? parseInt(String(req.query.maxRecords), 10) : NaN;
+                        const maxRecords = untilExhausted
+                                ? nsRestFetchUntilExhaustedCap()
+                                : Number.isFinite(rawMax)
+                                    ? Math.min(Math.max(1, rawMax), SALES_ORDER_FETCH_ALL_ABS_MAX)
+                                    : SALES_ORDER_FETCH_ALL_DEFAULT_MAX;
+
+                        const rawPage = req.query.pageSize != null ? parseInt(String(req.query.pageSize), 10) : NaN;
+                        const pageSize = Number.isFinite(rawPage) ? Math.min(Math.max(1, rawPage), 1_000) : undefined;
+
+                        // Use checkpoint offset if not explicitly overridden
+                        let startOffset = checkpoint.lastOffset || 0;
+                        if (req.query.offset != null) {
+                                const userOffset = parseInt(String(req.query.offset), 10);
+                                if (Number.isFinite(userOffset) && userOffset >= 0) startOffset = userOffset;
+                        }
 
             log.info(
                 `[SalesOrder List] fetchAll — maxRecords=${maxRecords}` +
@@ -501,24 +517,94 @@ router.get("/salesOrder", async (req: any, res: any) => {
                     (pageSize != null ? `, pageSize=${pageSize}` : "")
             );
 
-            const allRecords = await fetchAllSalesOrders({
-                q: req.query.q,
-                expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
-                maxRecords: untilExhausted ? undefined : maxRecords,
-                pageSize,
-                untilExhausted,
-            });
-            const persistResult = await persistRestSalesOrderItems(allRecords, {
-                save: persistDb,
-                queryContext: {
-                    mode: "fetchAll",
-                    maxRecords,
+            // Fetch and persist each record one by one to avoid data loss
+            let totalFetched = 0;
+            let totalPersisted = 0;
+            let persistErrors = [];
+            let failedSOs = [];
+            let allRecords = [];
+            try {
+                const fetchIterator = await fetchAllSalesOrders({
+                    q: req.query.q,
+                    expandSubResources: req.query.expandItems === "true" ? "item" : undefined,
+                    maxRecords: untilExhausted ? undefined : maxRecords,
+                    pageSize,
                     untilExhausted,
-                    pageSize: pageSize ?? null,
-                    q: req.query.q ?? null,
-                    dbPayloadSource: "per_id_get",
-                },
-            });
+                    offset: startOffset,
+                });
+                let currentOffset = startOffset;
+                for (const so of fetchIterator) {
+                    allRecords.push(so);
+                    totalFetched++;
+                    let persistOk = false;
+                    if (persistDb) {
+                        try {
+                            const result = await persistRestSalesOrderItems([so], {
+                                save: true,
+                                queryContext: {
+                                    mode: "fetchAll_streamed",
+                                    maxRecords,
+                                    untilExhausted,
+                                    pageSize: pageSize ?? null,
+                                    q: req.query.q ?? null,
+                                    dbPayloadSource: "per_id_get",
+                                },
+                            });
+                            if (result && result.upserted > 0) {
+                                totalPersisted++;
+                                persistOk = true;
+                            } else if (result && result.errors > 0) {
+                                persistErrors.push(result);
+                                failedSOs.push(so);
+                            }
+                        } catch (err) {
+                            persistErrors.push({ error: err, so });
+                            failedSOs.push(so);
+                        }
+                        // Retry once if failed
+                        if (!persistOk) {
+                            try {
+                                const retryResult = await persistRestSalesOrderItems([so], {
+                                    save: true,
+                                    queryContext: {
+                                        mode: "fetchAll_streamed_retry",
+                                        maxRecords,
+                                        untilExhausted,
+                                        pageSize: pageSize ?? null,
+                                        q: req.query.q ?? null,
+                                        dbPayloadSource: "per_id_get",
+                                        retry: true,
+                                    },
+                                });
+                                if (retryResult && retryResult.upserted > 0) {
+                                    totalPersisted++;
+                                    persistOk = true;
+                                    // Remove from failedSOs if retry succeeded
+                                    failedSOs.pop();
+                                } else if (retryResult && retryResult.errors > 0) {
+                                    persistErrors.push(retryResult);
+                                }
+                            } catch (retryErr) {
+                                persistErrors.push({ error: retryErr, so, retry: true });
+                            }
+                        }
+                        // Update checkpoint after each persist
+                        try {
+                            currentOffset++;
+                        
+                        } catch (e) {
+                            log.warn("[SO API] Could not write checkpoint file", e);
+                        }
+                    }
+                    if (totalFetched % 100 === 0) {
+                        log.info(`[SO API] Fetched and persisted ${totalFetched} records so far...`);
+                    }
+                }
+            } catch (err) {
+                log.error(`[SO API] Error during fetchAll streaming:`, err);
+            }
+
+            log.info(`[SO API] fetchAll fetched ${totalFetched} records from NetSuite. Persisted: ${totalPersisted}. Errors: ${persistErrors.length}`);
             const compareResult = compare
                 ? await runNsRestCompareBaselineBatch({
                       variant: "sales_order_staged",
@@ -527,7 +613,7 @@ router.get("/salesOrder", async (req: any, res: any) => {
                       orderSource: parseCompareOrderSource(req),
                       source: {
                           api: "salesOrder",
-                          mode: "fetchAll",
+                          mode: "fetchAll_streamed",
                           untilExhausted,
                           maxRecords,
                           pageSize: pageSize ?? null,
@@ -540,10 +626,13 @@ router.get("/salesOrder", async (req: any, res: any) => {
                 untilExhausted,
                 maxRecords,
                 pageSize: pageSize ?? null,
-                count: allRecords.length,
+                count: totalFetched,
                 items: allRecords,
+                persisted: totalPersisted,
+                persistErrors: persistErrors.length,
+                persistErrorDetails: persistErrors.length > 0 ? persistErrors.slice(0, 5) : undefined,
+                failedSOs,
                 persistDb,
-                persist: persistResult,
                 compare,
                 compareResult,
                 limits: untilExhausted
@@ -808,6 +897,95 @@ router.get("/salesOrder/:id", async (req: any, res: any) => {
     } catch (e: any) {
         log.error(`[SalesOrder Get] ${id} Error:`, e.message);
         res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+
+// ─── Sales Order Full Dump — Parallel Workers ────────────────────────────────
+//
+// GET /sales-order-dummy-dump           → dump ALL SOs (3 workers × ~5000 each)
+// GET /sales-order-dummy-dump?test=true → test run only (1 batch × 10 records)
+//
+// Each worker calls GET /salesOrder with fetchAll+persistDb, starting at a
+// different offset so the three workers cover the full ~14k+ dataset in parallel.
+//
+// Response is returned immediately (202 Accepted) — processing continues async.
+// Check ns_rest_sales_order_detail_dump_dummy in MongoDB for results.
+// Monitor server logs for [SO-DUMP-WORKER] progress.
+//
+// Optional query params:
+//   test=true           → 1 batch of 10 records only (for verification)
+//   batchSize=<n>       → records per worker (default 5000)
+//   batchCount=<n>      → number of parallel workers (default 3)
+//   pageSize=<n>        → NS list page size per internal request (default 1000)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/sales-order-dummy-dump", async (req: any, res: any) => {
+    const isTest    = req.query.test === "true";
+    const batchSize  = isTest ? 10 : (parseInt(String(req.query.batchSize  ?? "5000"), 10) || 5000);
+    const batchCount = isTest ?  1 : (parseInt(String(req.query.batchCount ?? "3"),    10) || 3);
+    const pageSize   = isTest ? 10 : (parseInt(String(req.query.pageSize   ?? "1000"), 10) || 1000);
+
+    const BASE_URL = `http://localhost:${process.env.PORT ?? 5002}/api/v4/salesOrder`;
+
+    const mode = isTest ? `TEST (1 batch × 10)` : `FULL (${batchCount} workers × ${batchSize} each)`;
+    log.info(`[SO-DUMP] Starting ${mode} dump → ${NS_REST_SO_DUMP_COLLECTION}`);
+
+    // Build one axios task per worker, each starting at a different offset
+    const tasks = Array.from({ length: batchCount }).map((_, i) => {
+        const offset = i * batchSize;
+        log.info(`[SO-DUMP-WORKER] Worker ${i + 1}/${batchCount}: offset=${offset}, maxRecords=${batchSize}, pageSize=${pageSize}`);
+        return axios
+            .get(BASE_URL, {
+                params: {
+                    fetchAll:   true,
+                    maxRecords: batchSize,
+                    offset:     offset,
+                    persistDb:  true,
+                    pageSize:   pageSize,
+                    // expandItems intentionally omitted — hydrateSalesOrderFollowLinkSubresources
+                    // already follows item sublist links; passing expandItems causes NetSuite
+                    // to inline everything in one GET which fails on large SOs.
+                },
+                // These dumps can take many minutes for large batches
+                timeout:          90 * 60 * 1000, // 90 min
+                maxContentLength: Infinity,
+                maxBodyLength:    Infinity,
+            })
+            .then((r) => ({ worker: i + 1, offset, status: r.status, count: r.data?.count ?? 0, persisted: r.data?.persisted ?? 0 }))
+            .catch((err) => {
+                const detail = err?.response?.data || err.message;
+                log.error(`[SO-DUMP-WORKER] Worker ${i + 1} (offset ${offset}) failed:`, detail);
+                return { worker: i + 1, offset, status: err?.response?.status ?? 0, error: detail, count: 0, persisted: 0 };
+            });
+    });
+
+    // Return 202 immediately so the HTTP connection doesn't time out on large runs.
+    // Workers continue running in the background.
+    res.status(202).json({
+        success: true,
+        mode,
+        batchCount,
+        batchSize,
+        pageSize,
+        collection: NS_REST_SO_DUMP_COLLECTION,
+        message: `${batchCount} worker(s) dispatched. Processing async — monitor logs for [SO-DUMP-WORKER] progress.`,
+    });
+
+    // Await workers in the background (after response is sent)
+    try {
+        const results = await Promise.all(tasks);
+        const totalFetched   = results.reduce((s, r) => s + r.count,     0);
+        const totalPersisted = results.reduce((s, r) => s + r.persisted,  0);
+        const errors         = results.filter((r:any) => r.error);
+        log.info(
+            `[SO-DUMP] All workers done — fetched=${totalFetched}, persisted=${totalPersisted}, errors=${errors.length}`,
+            results
+        );
+        if (errors.length) {
+            log.warn(`[SO-DUMP] ${errors.length} worker(s) had errors:`, errors);
+        }
+    } catch (err: any) {
+        log.error(`[SO-DUMP] Unexpected error waiting for workers:`, err?.message || err);
     }
 });
 

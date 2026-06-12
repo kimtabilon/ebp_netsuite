@@ -17,7 +17,7 @@ const logger_config_1 = __importDefault(require("./logger.config"));
 // If SO is using 3 slots, PO can only use 1 — and vice versa.
 // Workers stay high (5 each) but actual HTTP concurrency is capped here.
 // ─────────────────────────────────────────────────────────────────────────────
-const MAX_CONCURRENT = parseInt(process.env.NS_MAX_CONCURRENT || "4", 10);
+const MAX_CONCURRENT = parseInt(process.env.NS_MAX_CONCURRENT || "2", 10);
 // Max time (ms) a worker will wait in the queue before giving up.
 // Prevents infinite blocking when all slots are held by hung connections.
 const ACQUIRE_TIMEOUT_MS = 60000; // 60s

@@ -3,7 +3,7 @@ import log from "../config/logger.config";
 import { extractSalesOrderIdFromListItem } from "./netsuite.rest.client";
 
 /** Mongo collection for raw NetSuite REST sales order payloads (one document per order row). */
-export const NS_REST_SO_DUMP_COLLECTION = "ns_rest_sales_order_detail_dump";
+export const NS_REST_SO_DUMP_COLLECTION = "ns_rest_sales_order_detail_dump_dummy";
 
 export type PersistRestSalesOrderItemsOptions = {
     /** When false, no database writes (flag off). */

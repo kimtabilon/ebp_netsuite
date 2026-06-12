@@ -11,7 +11,7 @@ import log from "./logger.config";
 // Workers stay high (5 each) but actual HTTP concurrency is capped here.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MAX_CONCURRENT = parseInt(process.env.NS_MAX_CONCURRENT || "4", 10);
+const MAX_CONCURRENT = parseInt(process.env.NS_MAX_CONCURRENT || "2", 10);
 
 // Max time (ms) a worker will wait in the queue before giving up.
 // Prevents infinite blocking when all slots are held by hung connections.
