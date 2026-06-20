@@ -28,6 +28,7 @@ import { createMongoWatcher } from "./services/mongo_watcher.service";
 
 import { getWare2SoOrderOutbound } from "./services/warehouse.w2g"
 import { syncAllWare2GoInboundShipments } from "./services/inbound.w2g"
+import { syncCreditMemosToNetsuite } from "./services/credit_memo.sync";
 dotenv.config();
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -241,6 +242,33 @@ export const runMainSyncJob = async () => {
         } catch (error) {
             console.log(error)
         }
+
+
+        try {
+            await stageBills();
+            console.log("Bill stage run")
+        } catch (error) {
+            console.log(error)
+        }
+        try {
+            await syncStagedDummyBillsOnce();
+            console.log("Bill Sync run")
+        } catch (error) {
+            console.log(error)
+        }
+
+        try {
+            await stageCreditBillsDummy();
+            console.log("Bill credit stage run")
+        } catch (error) {
+            console.log(error)
+        }
+        try {
+            await syncCreditMemosToNetsuite();
+            console.log("Bill credit Sync run")
+        } catch (error) {
+            console.log(error)
+        }
     } catch (error: any) {
         log.error('Sync cron job failed: ', error);
     } finally {
@@ -263,25 +291,25 @@ cron.schedule('*/30 * * * *', runMainSyncJob);
 // GET /api/v4/force-run-crons
 app.get("/api/v4/force-run-crons", (req, res) => {
     const target = req.query.target as string;
-    
-    if (target === "w2g-2h") {
-        runW2gEvery2Hours();
-        res.json({ message: "W2G 2-hour job started in the background." });
-    } else if (target === "w2g-weekly") {
-        runW2gWeekly();
-        res.json({ message: "W2G Weekly job started in the background." });
-    } else if (target === "main-sync") {
-        runMainSyncJob();
-        res.json({ message: "Main Sync job started in the background." });
-    } else {
-        // Run all
-        runW2gEvery2Hours();
-        runMainSyncJob();
-        res.json({ 
-            message: "All primary cron jobs (W2G & Main Sync) started in the background.",
-            hint: "You can trigger specific ones by adding ?target=w2g-2h, ?target=w2g-weekly, or ?target=main-sync to the URL."
-        });
-    }
+
+    // if (target === "w2g-2h") {
+    //     runW2gEvery2Hours();
+    //     res.json({ message: "W2G 2-hour job started in the background." });
+    // } else if (target === "w2g-weekly") {
+    //     runW2gWeekly();
+    //     res.json({ message: "W2G Weekly job started in the background." });
+    // } else if (target === "main-sync") {
+    //     runMainSyncJob();
+    //     res.json({ message: "Main Sync job started in the background." });
+    // } else {
+    //     // Run all
+    //     runW2gEvery2Hours();
+    //     runMainSyncJob();
+    //     res.json({
+    //         message: "All primary cron jobs (W2G & Main Sync) started in the background.",
+    //         hint: "You can trigger specific ones by adding ?target=w2g-2h, ?target=w2g-weekly, or ?target=main-sync to the URL."
+    //     });
+    // }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
