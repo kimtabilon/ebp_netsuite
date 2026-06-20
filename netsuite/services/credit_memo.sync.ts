@@ -25,9 +25,9 @@ export async function syncCreditMemosToNetsuite() {
     const filter = {
         po_sync: true,
         bill_sync: true,
-        po_type: "Stocking"
-        // ns_synced: { $ne: true },
-        // ns_failed: { $ne: true }
+        po_type: "Stocking",
+        ns_synced: { $ne: true },
+        ns_failed: { $ne: true }
     };
 
     const credits = await collection.find(filter).toArray();
