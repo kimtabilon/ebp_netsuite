@@ -25,8 +25,7 @@ const syncPurchaseOrdersToNetsuite = async () => {
     const dummyCol = ns_db.collection("suite_purchase_order_dummy");
     const results = [];
     logger_config_1.default.info("[syncPurchaseOrdersToNetsuite] Fast Sync starting with cursor-based processing...");
-    const filter = { po_number: 233175 };
-    // const filter = { $or: [{ ns_synced: null },] };
+    const filter = { $or: [{ ns_synced: null }] };
     const totalToProcess = await dummyCol.countDocuments(filter);
     logger_config_1.default.info(`[syncPurchaseOrdersToNetsuite] Found ${totalToProcess} dummy POs to sync.`);
     if (totalToProcess === 0)

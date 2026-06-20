@@ -385,3 +385,21 @@
   }
 }
 
+[
+{
+    "asn":"035KITTOSTOCKIL-20N2PK",
+  "kit":"20N10K02PK", 
+  "kitSerial":  "CGA030336",
+   
+  "skus":[
+    {
+    "sku":"20N10K0",
+    "itemSerials":   "SCAA252721BA3" 
+},
+    {
+    "sku":"20N10K0",
+    "itemSerials":   "SCAA252722D83" 
+}
+
+]
+}]

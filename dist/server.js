@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.runMainSyncJob = exports.runW2gWeekly = exports.runW2gEvery2Hours = void 0;
 const app_1 = __importDefault(require("./app"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const node_cron_1 = __importDefault(require("node-cron"));
@@ -103,11 +104,9 @@ function withTimeout(fn, label, ms = CRON_TIMEOUT_MS) {
     });
 }
 // ═══════════════════════════════════════════════════════════════════════════════
-// CRON JOBS
+// CRON JOBS & MANUAL TRIGGERS
 // ═══════════════════════════════════════════════════════════════════════════════
-// 1. W2G dummp cron jobs 
-// Job 1: Runs every 2 hours
-node_cron_1.default.schedule('0 */2 * * *', async () => {
+const runW2gEvery2Hours = async () => {
     try {
         await (0, warehouse_w2g_1.getWare2SoOrderOutbound)();
     }
@@ -121,14 +120,14 @@ node_cron_1.default.schedule('0 */2 * * *', async () => {
         logger_config_1.default.info(' W2g Inbound Shipment cron failed : ', error);
     }
     logger_config_1.default.info('Every 2 hours job executed at: ' + new Date().toISOString());
-});
-// // Job 2: Runs every Saturday at 00:00 (midnight)
-node_cron_1.default.schedule('0 0 * * 6', async () => {
+};
+exports.runW2gEvery2Hours = runW2gEvery2Hours;
+const runW2gWeekly = async () => {
     try {
         await (0, warehouse_w2g_1.getWare2SoOrderOutbound)({ forceRestart: false, retryFailedOnly: false, all: true });
     }
     catch (error) {
-        logger_config_1.default.info('Weekly W2g SO Outbound cron cron failed : ', error);
+        logger_config_1.default.info('Weekly W2g SO Outbound cron failed : ', error);
     }
     try {
         await (0, inbound_w2g_1.syncAllWare2GoInboundShipments)({ forceRestart: false, retryFailedOnly: false, all: true });
@@ -137,10 +136,10 @@ node_cron_1.default.schedule('0 0 * * 6', async () => {
         logger_config_1.default.info('Weekly W2g Inbound Shipment cron failed : ', error);
     }
     logger_config_1.default.info('Weekly Saturday job executed at: ' + new Date().toISOString());
-});
-// Define a flag outside the cron job
+};
+exports.runW2gWeekly = runW2gWeekly;
 let isSyncJobRunning = false;
-node_cron_1.default.schedule('0 */5 * * *', async () => {
+const runMainSyncJob = async () => {
     if (isSyncJobRunning) {
         logger_config_1.default.info('Previous sync job is still running. Skipping this cron run.');
         return;
@@ -197,6 +196,40 @@ node_cron_1.default.schedule('0 */5 * * *', async () => {
     finally {
         isSyncJobRunning = false;
         logger_config_1.default.info('Scheduled sync job finished.');
+    }
+};
+exports.runMainSyncJob = runMainSyncJob;
+// 1. W2G dummp cron jobs 
+// Job 1: Runs every 2 hours
+node_cron_1.default.schedule('0 */2 * * *', exports.runW2gEvery2Hours);
+// Job 2: Runs every Saturday at 00:00 (midnight)
+node_cron_1.default.schedule('0 0 * * 6', exports.runW2gWeekly);
+// Job 3: Every 30 mins
+node_cron_1.default.schedule('*/30 * * * *', exports.runMainSyncJob);
+// 4. MANUAL TRIGGER ENDPOINT
+// GET /api/v4/force-run-crons
+app_1.default.get("/api/v4/force-run-crons", (req, res) => {
+    const target = req.query.target;
+    if (target === "w2g-2h") {
+        (0, exports.runW2gEvery2Hours)();
+        res.json({ message: "W2G 2-hour job started in the background." });
+    }
+    else if (target === "w2g-weekly") {
+        (0, exports.runW2gWeekly)();
+        res.json({ message: "W2G Weekly job started in the background." });
+    }
+    else if (target === "main-sync") {
+        (0, exports.runMainSyncJob)();
+        res.json({ message: "Main Sync job started in the background." });
+    }
+    else {
+        // Run all
+        (0, exports.runW2gEvery2Hours)();
+        (0, exports.runMainSyncJob)();
+        res.json({
+            message: "All primary cron jobs (W2G & Main Sync) started in the background.",
+            hint: "You can trigger specific ones by adding ?target=w2g-2h, ?target=w2g-weekly, or ?target=main-sync to the URL."
+        });
     }
 });
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -4,7 +4,7 @@ logs
 .env
 env
 schemas/*
-/dist
+
 
 itemfull.js
 scripts.md
